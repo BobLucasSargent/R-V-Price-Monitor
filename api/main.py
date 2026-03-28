@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import structlog
+import os
 
 from config.settings import get_settings
 from api.routes import prices, index, status
@@ -15,6 +16,15 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
     settings = get_settings()
     log.info("app.startup", app=settings.APP_NAME)
+
+    # Auto-create database tables
+    try:
+        db_url = os.environ.get("DATABASE_URL_SYNC", settings.DATABASE_URL_SYNC)
+        from storage.models import create_tables
+        create_tables(db_url)
+        log.info("app.tables_created")
+    except Exception as e:
+        log.warning("app.tables_error", error=str(e))
 
     # Import all collectors to trigger registration
     import collectors.supermercados.jumbo
