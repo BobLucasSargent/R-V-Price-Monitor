@@ -1,0 +1,33 @@
+name: R&V IPC — Recolección diaria
+ 
+on:
+  schedule:
+    # 8:00 AM Argentina (UTC-3) = 11:00 UTC
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+    # Permite trigger manual desde GitHub
+ 
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+ 
+    steps:
+      - name: Trigger pipeline diario
+        run: |
+          echo "Triggering R&V IPC daily collection..."
+          curl -s -X POST "https://r-v-price-monitor-production.up.railway.app/api/v1/index/run?periodo=diario" \
+            -H "Content-Type: application/json" \
+            --max-time 120 || echo "Request timed out or failed"
+ 
+      - name: Verificar health
+        run: |
+          curl -s "https://r-v-price-monitor-production.up.railway.app/health"
+ 
+
+
+
+
+
+
+
