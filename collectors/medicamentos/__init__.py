@@ -1,0 +1,1 @@
+from collectors.medicamentos.farmacity import FarmacityCollector

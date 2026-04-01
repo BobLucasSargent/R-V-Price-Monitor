@@ -1,0 +1,1 @@
+from collectors.delivery.pedidosya import PedidosYaCollector

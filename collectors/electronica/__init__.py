@@ -1,1 +1,1 @@
-
+from collectors.electronica.fravega import FravegaCollector

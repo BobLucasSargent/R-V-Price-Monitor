@@ -31,7 +31,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="01", nombre="Alimentos y bebidas no alcohólicas",
         nombre_corto="Alimentos", peso_gba=23.44,
-        collector_ids=["jumbo", "coto", "carrefour"],
+        collector_ids=["supermercados"],
         variedades=[
             Variedad("01.1.1", "Pan y cereales", 4.05,
                      ["pan", "galletitas", "harina", "arroz", "fideos", "cereales"]),
@@ -60,7 +60,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="02", nombre="Bebidas alcohólicas y tabaco",
         nombre_corto="Bebidas y tabaco", peso_gba=3.27,
-        collector_ids=["jumbo", "coto"],
+        collector_ids=["supermercados"],
         variedades=[
             Variedad("02.1.2", "Vinos", 1.07, ["vino", "tinto", "malbec"]),
             Variedad("02.1.3", "Cerveza", 0.29, ["cerveza", "quilmes", "brahma"]),
@@ -80,7 +80,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="04", nombre="Vivienda, agua, electricidad, gas y otros combustibles",
         nombre_corto="Vivienda y servicios", peso_gba=10.46,
-        collector_ids=["zonaprop", "tarifas_electricidad", "tarifas_gas", "tarifas_agua"],
+        collector_ids=["alquileres", "tarifas"],
         variedades=[
             Variedad("04.1.1", "Alquiler de la vivienda", 3.48, ["alquiler"]),
             Variedad("04.1.3", "Gastos comunes / expensas", 2.32, ["expensas"]),
@@ -93,7 +93,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="05", nombre="Equipamiento y mantenimiento del hogar",
         nombre_corto="Equipamiento hogar", peso_gba=6.27,
-        collector_ids=["fravega", "jumbo", "coto"],
+        collector_ids=["fravega", "supermercados"],
         variedades=[
             Variedad("05.3", "Artefactos para el hogar", 1.14,
                      ["heladera", "lavarropas", "microondas", "horno"]),
@@ -105,7 +105,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="06", nombre="Salud",
         nombre_corto="Salud", peso_gba=8.80,
-        collector_ids=["farmacity", "prepagas"],
+        collector_ids=["farmacity"],
         variedades=[
             Variedad("06.1.1", "Productos farmacéuticos", 3.53,
                      ["ibuprofeno", "paracetamol", "tafirol", "aspirina"]),
@@ -118,7 +118,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="07", nombre="Transporte",
         nombre_corto="Transporte", peso_gba=11.59,
-        collector_ids=["combustibles", "transporte_publico"],
+        collector_ids=["combustibles"],
         variedades=[
             Variedad("07.2.2", "Combustibles y lubricantes", 3.78,
                      ["nafta", "gasoil", "super", "premium", "diesel"]),
@@ -177,7 +177,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="12", nombre="Bienes y servicios varios",
         nombre_corto="Bienes y serv. varios", peso_gba=3.55,
-        collector_ids=["jumbo", "coto", "farmacity"],
+        collector_ids=["supermercados", "farmacity"],
         variedades=[
             Variedad("12.1.1", "Salones de peluquería", 0.85, ["peluquería", "corte"]),
             Variedad("12.1.3", "Artículos cuidado personal", 1.97,

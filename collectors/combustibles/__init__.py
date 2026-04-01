@@ -1,0 +1,1 @@
+from collectors.combustibles.combustibles import CombustiblesCollector

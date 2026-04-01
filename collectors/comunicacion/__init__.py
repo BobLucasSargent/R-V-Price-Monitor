@@ -1,1 +1,1 @@
-
+from collectors.comunicacion.planes import ComunicacionesCollector

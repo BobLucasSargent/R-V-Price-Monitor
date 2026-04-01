@@ -14,6 +14,9 @@ from datetime import date, timedelta
 from collections import defaultdict
 import structlog
 
+# Import collectors package to trigger @register_collector decorators
+import collectors  # noqa: F401
+
 from collectors.base import PriceObservation
 from collectors.registry import get_all_collectors, get_collector, list_collectors
 from engine.calculator import (

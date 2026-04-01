@@ -1,1 +1,1 @@
-
+from collectors.alquileres.zonaprop import AlquileresCollector

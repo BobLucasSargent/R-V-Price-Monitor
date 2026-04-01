@@ -1,24 +1,16 @@
 """
-R&V IPC — Comunicaciones collector.
+R&V IPC — Comunicaciones collector (Playwright).
 
-Covers COICOP 08 Comunicación (2.81% peso GBA):
-- 08.3.2 Telefonía móvil (1.39%)
-- 08.3.3 Internet (0.76%)
-- 08.3.1 Telefonía fija (0.58%)
-
-Scrapes plan prices from Personal, Claro, Movistar, Flow, Telecentro.
+Covers COICOP 08 Comunicación (~3.2%).
+Telecom sites (Personal, Claro, Movistar, Flow, Telecentro) are all SPAs.
 """
-from collectors.base import BaseCollector, PriceObservation
+from collectors.base import PlaywrightCollector, PriceObservation, parse_price_ar
 from collectors.registry import register_collector
-from bs4 import BeautifulSoup
 import structlog
-import re
 
 log = structlog.get_logger()
 
-# Target pages for plan prices
 SOURCES = [
-    # Mobile plans
     {
         "nombre": "Personal plan celular",
         "url": "https://www.personal.com.ar/planes",
@@ -37,13 +29,6 @@ SOURCES = [
         "coicop": "08.3.2",
         "tipo": "celular",
     },
-    # Internet / cable
-    {
-        "nombre": "Flow internet + cable",
-        "url": "https://www.flow.com.ar/packs",
-        "coicop": "08.3.3",
-        "tipo": "internet",
-    },
     {
         "nombre": "Telecentro internet",
         "url": "https://telecentro.com.ar/internet",
@@ -54,19 +39,22 @@ SOURCES = [
 
 
 @register_collector
-class ComunicacionesCollector(BaseCollector):
+class ComunicacionesCollector(PlaywrightCollector):
     collector_id = "comunicaciones"
     division_coicop = "08"
-    description = "Comunicaciones — Planes celular e internet"
+    description = "Comunicaciones — Planes celular e internet (Playwright)"
 
-    def collect(self) -> list[PriceObservation]:
+    def collect_with_page(self, page) -> list[PriceObservation]:
         observations = []
 
         for source in SOURCES:
             try:
-                prices = self._scrape_plans(source["url"])
+                page.goto(source["url"], wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(4000)
+
+                prices = self._extract_plan_prices(page)
+
                 if prices:
-                    # Take median plan price
                     median = sorted(prices)[len(prices) // 2]
                     observations.append(PriceObservation(
                         producto=source["nombre"],
@@ -84,41 +72,32 @@ class ComunicacionesCollector(BaseCollector):
                         },
                     ))
             except Exception as e:
-                log.warning("comunicaciones.source_error",
-                            source=source["nombre"], error=str(e))
+                log.debug("comunicaciones.source_error",
+                          source=source["nombre"], error=str(e))
 
         return observations
 
-    def _scrape_plans(self, url: str) -> list[float]:
-        """Extract plan prices from a telecom provider page."""
+    def _extract_plan_prices(self, page) -> list[float]:
+        """Extract plan prices from telecom provider page."""
         prices = []
 
-        try:
-            resp = self.fetch(url)
-            soup = BeautifulSoup(resp.text, "lxml")
+        # Generic price selectors across telecom sites
+        price_elements = page.query_selector_all(
+            "[class*='price'], [class*='Price'], "
+            "[class*='valor'], [class*='Valor'], "
+            "[class*='monto'], [data-price], "
+            "[class*='plan-price'], [class*='pack-price'], "
+            "[class*='amount'], [class*='Amount']"
+        )
 
-            # Generic price selectors that work across telecom sites
-            price_elements = soup.select(
-                "[class*='price'], [class*='Price'], "
-                "[class*='valor'], [class*='Valor'], "
-                "[class*='monto'], [data-price], "
-                ".plan-price, .pack-price"
-            )
-
-            for el in price_elements[:15]:
-                text = el.get_text(strip=True)
-                price = self._parse_price(text)
-                # Sanity: monthly telecom plans in AR (2025-2026)
+        for el in price_elements[:20]:
+            try:
+                text = el.inner_text().strip()
+                price = parse_price_ar(text)
+                # Monthly telecom plan in AR 2025-2026
                 if price and 5_000 < price < 200_000:
                     prices.append(price)
-
-        except Exception as e:
-            log.debug("comunicaciones.scrape_error", url=url, error=str(e))
+            except Exception:
+                continue
 
         return prices
-
-    @staticmethod
-    def _parse_price(text: str) -> float | None:
-        text = text.replace("$", "").replace(".", "").replace(",", ".").strip()
-        match = re.search(r"(\d+(?:\.\d+)?)", text)
-        return float(match.group(1)) if match else None
