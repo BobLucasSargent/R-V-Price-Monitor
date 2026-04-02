@@ -1,4 +1,4 @@
-"""R&V IPC — FastAPI application (auto-collecting)."""
+"""R&V IPC — FastAPI application (with persistence + auto month closing)."""
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import date, datetime, timedelta
@@ -14,7 +14,7 @@ log = structlog.get_logger()
 app = FastAPI(
     title="R&V IPC — Proxy de Inflación Argentina",
     description="Índice de precios al consumidor proxy con frecuencia semanal.",
-    version="0.3.0",
+    version="0.4.0",
 )
 
 app.add_middleware(
@@ -25,75 +25,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── In-memory store ─────────────────────────────────────────────────────────
+# ─── In-memory cache ─────────────────────────────────────────────────────────
 _latest_result = None
 _last_run_time: datetime | None = None
-_MIN_RUN_INTERVAL = timedelta(hours=4)  # Don't re-run more than once per 4 hours
+_MIN_RUN_INTERVAL = timedelta(hours=4)
 
 
 def _needs_fresh_run() -> bool:
-    """Check if we need to run the pipeline."""
     if _latest_result is None:
         return True
     if _last_run_time is None:
         return True
-    # Re-run if last run was more than 4 hours ago
     if datetime.utcnow() - _last_run_time > _MIN_RUN_INTERVAL:
         return True
-    # Re-run if last result had an error
     if "error" in _latest_result:
         return True
     return False
 
 
 def _run_pipeline_safe() -> dict:
-    """Run the pipeline with error handling. Returns result dict."""
     global _latest_result, _last_run_time
     try:
-        # Import here to avoid circular imports and keep startup fast
-        import collectors  # noqa: F401 — triggers @register_collector
-        from engine.pipeline import run_pipeline
+        from engine.pipeline import run_pipeline, auto_close_previous_month
+
+        # Auto-close previous month if needed (e.g. it's April 1, close March)
+        auto_close_previous_month()
 
         result = run_pipeline(fecha=date.today(), periodo_tipo="diario")
         _last_run_time = datetime.utcnow()
 
-        # Only update _latest_result if we got actual prices
         if result and result.get("n_precios_recolectados", 0) > 0:
             _latest_result = result
-            log.info("pipeline.success",
-                     n_precios=result["n_precios_recolectados"],
-                     nivel_general=result["nivel_general"])
         else:
-            # Pipeline ran but got no prices — store result but mark it
             _latest_result = result
-            log.warning("pipeline.no_prices", result_keys=list(result.keys()))
 
         return result
 
     except Exception as e:
         log.error("pipeline.exception", error=str(e))
-        _last_run_time = datetime.utcnow()  # Don't retry immediately
+        _last_run_time = datetime.utcnow()
         return {"error": str(e), "fecha": str(date.today())}
-
-
-def _get_empalme_fallback() -> dict:
-    """Return empalme data as fallback when pipeline hasn't run."""
-    pesos = get_all_weights()
-    ng = sum(
-        IPC_DIVISIONES_FEB2026.get(cod, 0) * (pesos.get(cod, 0) / 100)
-        for cod in pesos
-    )
-    return {
-        "fecha": "2026-02-01",
-        "nivel_general": round(ng, 2),
-        "variacion_periodo": 2.9,
-        "inflacion_anualizada": 40.7,
-        "cobertura_pct": 88.5,
-        "n_precios_recolectados": 0,
-        "divisiones_con_datos": 0,
-        "es_oficial": True,
-        "fuente": "INDEC (empalme — pipeline no ejecutado aún)",
-    }
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
@@ -104,7 +75,7 @@ def root():
         "name": "R&V IPC",
         "description": "Proxy de inflación semanal — Argentina",
         "empalme": "IPC-INDEC feb 2026 = 10.714,63",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "docs": "/docs",
     }
 
@@ -120,49 +91,127 @@ def health():
 
 @app.get("/api/v1/index/nivel-general")
 def get_nivel_general():
-    """
-    Returns the latest R&V IPC index.
-    Auto-runs the pipeline if no fresh data is available.
-    """
-    # If we need fresh data, run the pipeline
+    """Returns latest R&V IPC index. Auto-runs pipeline if no fresh data."""
     if _needs_fresh_run():
         result = _run_pipeline_safe()
-        # If pipeline succeeded with prices, return it
         if result.get("n_precios_recolectados", 0) > 0:
             return result
 
-    # Return cached result if available
     if _latest_result and _latest_result.get("n_precios_recolectados", 0) > 0:
         return _latest_result
 
-    # Fallback to empalme data
-    return _get_empalme_fallback()
+    # Fallback
+    pesos = get_all_weights()
+    ng = sum(
+        IPC_DIVISIONES_FEB2026.get(cod, 0) * (pesos.get(cod, 0) / 100)
+        for cod in pesos
+    )
+    return {
+        "fecha": "2026-02-01",
+        "nivel_general": round(ng, 2),
+        "variacion_periodo": 2.9,
+        "inflacion_anualizada": 40.7,
+        "n_precios_recolectados": 0,
+        "es_oficial": True,
+        "fuente": "INDEC (empalme — pipeline no ejecutado aún)",
+    }
 
 
 @app.post("/api/v1/index/run")
 def trigger_pipeline(
     periodo: str = Query("diario", enum=["diario", "semanal", "mensual"]),
 ):
-    """Force-run collectors and calculate index. Called by daily cron job."""
+    """Force-run collectors and calculate index."""
     global _latest_result, _last_run_time
-
     try:
-        import collectors  # noqa: F401
-        from engine.pipeline import run_pipeline
-
+        from engine.pipeline import run_pipeline, auto_close_previous_month
+        auto_close_previous_month()
         result = run_pipeline(fecha=date.today(), periodo_tipo=periodo)
         _latest_result = result
         _last_run_time = datetime.utcnow()
         return result
-
     except Exception as e:
-        log.error("pipeline.manual_trigger_error", error=str(e))
+        log.error("pipeline.trigger_error", error=str(e))
         return {"error": str(e), "periodo": periodo}
+
+
+@app.post("/api/v1/index/close-month")
+def close_month_endpoint(
+    mes: str = Query(..., description="Month to close, format YYYY-MM (e.g. 2026-03)"),
+):
+    """Manually close a month and compute final indices."""
+    try:
+        from engine.pipeline import close_month
+        result = close_month(mes)
+        return result
+    except Exception as e:
+        return {"error": str(e), "mes": mes}
+
+
+@app.get("/api/v1/index/serie")
+def get_serie(
+    nivel: str = Query("nivel_general", description="nivel_general or division code (01, 02, etc.)"),
+):
+    """
+    Get full time series: INDEC official + R&V proxy.
+    Returns monthly data from jan 2017 onwards.
+    """
+    try:
+        from storage.repository import get_index_series, ensure_tables, seed_empalme_data
+        ensure_tables()
+        seed_empalme_data()
+
+        # Get R&V series from DB
+        rv_series = get_index_series(nivel)
+
+        # Build combined series: INDEC historical + R&V proxy
+        # The dashboard already has INDEC data hardcoded (110 months)
+        # Here we just return the R&V extension
+        return {
+            "nivel": nivel,
+            "empalme_fecha": "2026-02",
+            "empalme_valor": EMPALME_NIVEL_GENERAL if nivel == "nivel_general" else IPC_DIVISIONES_FEB2026.get(nivel),
+            "serie_rv": rv_series,
+            "n_meses_rv": len([s for s in rv_series if not s["es_oficial"]]),
+        }
+    except Exception as e:
+        return {"error": str(e), "nivel": nivel}
+
+
+@app.get("/api/v1/index/month-status")
+def get_month_status(
+    mes: str = Query(None, description="Month YYYY-MM (default: current)"),
+):
+    """Get collection status for a specific month."""
+    try:
+        from storage.repository import (
+            get_price_count_by_month, get_collection_days_in_month,
+            get_monthly_avg_by_division, ensure_tables,
+        )
+        ensure_tables()
+
+        if not mes:
+            mes = date.today().strftime("%Y-%m")
+
+        n_precios = get_price_count_by_month(mes)
+        n_dias = get_collection_days_in_month(mes)
+        avgs = get_monthly_avg_by_division(mes)
+
+        return {
+            "mes": mes,
+            "n_precios_totales": n_precios,
+            "n_dias_recoleccion": n_dias,
+            "divisiones_con_datos": len(avgs),
+            "promedios_por_division": {
+                k: round(v, 2) for k, v in avgs.items()
+            },
+        }
+    except Exception as e:
+        return {"error": str(e), "mes": mes}
 
 
 @app.get("/api/v1/index/divisiones")
 def get_divisiones():
-    # If we have fresh pipeline data, use it
     if _latest_result and "divisiones" in _latest_result:
         divs = _latest_result["divisiones"]
         return {
@@ -183,7 +232,6 @@ def get_divisiones():
             ],
         }
 
-    # Fallback to empalme
     return {
         "fecha": "2026-02-01",
         "fuente": "INDEC (empalme)",
@@ -230,7 +278,6 @@ def get_status():
         collectors_list = list_collectors()
         return {
             "total": len(collectors_list),
-            "status": "Collectors auto-run on first request + daily cron",
             "last_run": _last_run_time.isoformat() if _last_run_time else None,
             "collectors": [
                 {
@@ -249,9 +296,9 @@ def get_status():
 def debug_run_single(
     collector_id: str = Query(..., description="Collector ID to test"),
 ):
-    """Debug endpoint: run a single collector and see raw results."""
+    """Debug: run a single collector and see raw results."""
     try:
-        import collectors  # noqa: F401
+        import collectors as _c  # noqa: F401
         from collectors.registry import get_collector
         collector = get_collector(collector_id)
         observations = collector.run()
