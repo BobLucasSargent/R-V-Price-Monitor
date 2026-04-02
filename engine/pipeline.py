@@ -32,6 +32,8 @@ from storage.repository import (
     get_monthly_avg_by_division, get_previous_month_indices,
     save_monthly_index, seed_empalme_data,
     get_price_count_by_month, get_collection_days_in_month,
+    get_daily_avg_by_division, get_first_day_of_month_with_data,
+    get_last_day_of_month_with_data, get_all_daily_avgs_in_month,
 )
 
 log = structlog.get_logger()
@@ -333,6 +335,183 @@ def _build_fallback_result(fecha: date, mes: str) -> dict:
         "es_oficial": False,
         "fuente": "R&V IPC (sin datos — fallback empalme)",
     }
+
+
+# ─── Intra-month variation ────────────────────────────────────────────────────
+
+def calcular_variacion_intrames(mes: str | None = None) -> dict:
+    """
+    Calculate intra-month price variation: latest day vs first day of the month.
+
+    This gives a real-time estimate of how prices are moving within the
+    current month, even before the month closes.
+
+    Compares geometric mean prices on the most recent day with data
+    vs the first day of the month with data, per division.
+
+    Returns a dict with:
+    - variacion_acumulada_mes: weighted (Laspeyres) overall variation
+    - variaciones_por_division: variation per division
+    - fecha_inicio / fecha_fin: the days being compared
+    - serie_diaria: daily evolution for charting
+    """
+    if mes is None:
+        mes = date.today().strftime("%Y-%m")
+
+    try:
+        ensure_tables()
+    except Exception:
+        pass
+
+    primer_dia = get_first_day_of_month_with_data(mes)
+    ultimo_dia = get_last_day_of_month_with_data(mes)
+
+    if not primer_dia or not ultimo_dia:
+        return {
+            "mes": mes,
+            "error": "Sin datos para este mes",
+            "n_dias": 0,
+        }
+
+    # If we only have one day of data, we can't compute variation yet
+    if primer_dia == ultimo_dia:
+        avg_dia = get_daily_avg_by_division(primer_dia)
+        return {
+            "mes": mes,
+            "fecha_inicio": str(primer_dia),
+            "fecha_fin": str(ultimo_dia),
+            "n_dias": 1,
+            "variacion_acumulada_mes": 0.0,
+            "mensaje": "Solo 1 día con datos — se necesitan al menos 2 días para calcular variación",
+            "divisiones_con_datos": list(avg_dia.keys()),
+            "variaciones_por_division": {},
+            "serie_diaria": {},
+        }
+
+    # Get averages for first and last day
+    avg_inicio = get_daily_avg_by_division(primer_dia)
+    avg_fin = get_daily_avg_by_division(ultimo_dia)
+
+    if not avg_inicio or not avg_fin:
+        return {
+            "mes": mes,
+            "error": "No se pudieron calcular promedios diarios",
+        }
+
+    # Variation per division
+    variaciones_div = {}
+    pesos = get_all_weights()
+
+    for div_code in avg_fin:
+        if div_code in EXCLUIDAS:
+            continue
+        precio_inicio = avg_inicio.get(div_code)
+        precio_fin = avg_fin.get(div_code)
+        if precio_inicio and precio_inicio > 0 and precio_fin and precio_fin > 0:
+            variaciones_div[div_code] = variacion_porcentual(precio_fin, precio_inicio)
+
+    # Weighted aggregate (Laspeyres-style)
+    if variaciones_div:
+        peso_total = sum(pesos.get(k, 0) for k in variaciones_div)
+        if peso_total > 0:
+            var_acumulada = sum(
+                variaciones_div[k] * (pesos.get(k, 0) / peso_total)
+                for k in variaciones_div
+            )
+        else:
+            var_acumulada = 0.0
+    else:
+        var_acumulada = 0.0
+
+    # Build daily series for charting
+    daily_avgs = get_all_daily_avgs_in_month(mes)
+    serie_diaria = _build_daily_series(daily_avgs, pesos)
+
+    n_dias = get_collection_days_in_month(mes)
+
+    # Division detail
+    div_detail = {}
+    for div in DIVISIONES:
+        cod = div.codigo
+        if cod in EXCLUIDAS:
+            continue
+        var = variaciones_div.get(cod)
+        div_detail[cod] = {
+            "nombre": div.nombre_corto,
+            "peso_ajustado": pesos.get(cod, 0),
+            "variacion_acumulada": round(var, 2) if var is not None else None,
+            "precio_inicio": round(avg_inicio.get(cod, 0), 2) if cod in avg_inicio else None,
+            "precio_fin": round(avg_fin.get(cod, 0), 2) if cod in avg_fin else None,
+            "tiene_datos": var is not None,
+        }
+
+    return {
+        "mes": mes,
+        "fecha_inicio": str(primer_dia),
+        "fecha_fin": str(ultimo_dia),
+        "n_dias": n_dias,
+        "variacion_acumulada_mes": round(var_acumulada, 2),
+        "inflacion_anualizada_estimada": round(inflacion_anualizada(var_acumulada), 1),
+        "divisiones_con_datos": sum(1 for v in variaciones_div.values() if v is not None),
+        "cobertura_pct": round(sum(pesos.get(k, 0) for k in variaciones_div), 1),
+        "variaciones_por_division": div_detail,
+        "serie_diaria": serie_diaria,
+    }
+
+
+def _build_daily_series(
+    daily_avgs: dict[str, dict[str, float]],
+    pesos: dict[str, float],
+) -> list[dict]:
+    """
+    Build a daily time series of cumulative variation from day 1.
+
+    Returns: [
+        {"fecha": "2026-04-01", "var_acumulada": 0.0, "var_por_division": {...}},
+        {"fecha": "2026-04-02", "var_acumulada": 0.12, ...},
+        ...
+    ]
+    """
+    if not daily_avgs:
+        return []
+
+    dias = sorted(daily_avgs.keys())
+    base_day = dias[0]
+    base_avgs = daily_avgs[base_day]
+
+    serie = []
+    for dia in dias:
+        avgs_hoy = daily_avgs[dia]
+
+        # Variation vs base day, per division
+        vars_div = {}
+        for div_code, precio_hoy in avgs_hoy.items():
+            if div_code in EXCLUIDAS:
+                continue
+            precio_base = base_avgs.get(div_code)
+            if precio_base and precio_base > 0:
+                vars_div[div_code] = variacion_porcentual(precio_hoy, precio_base)
+
+        # Weighted aggregate
+        if vars_div:
+            peso_total = sum(pesos.get(k, 0) for k in vars_div)
+            if peso_total > 0:
+                var_acum = sum(
+                    vars_div[k] * (pesos.get(k, 0) / peso_total)
+                    for k in vars_div
+                )
+            else:
+                var_acum = 0.0
+        else:
+            var_acum = 0.0
+
+        serie.append({
+            "fecha": dia,
+            "var_acumulada": round(var_acum, 3),
+            "var_por_division": {k: round(v, 2) for k, v in vars_div.items()},
+        })
+
+    return serie
 
 
 # ─── Convenience wrappers ────────────────────────────────────────────────────

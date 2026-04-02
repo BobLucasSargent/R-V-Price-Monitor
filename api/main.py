@@ -210,6 +210,27 @@ def get_month_status(
         return {"error": str(e), "mes": mes}
 
 
+@app.get("/api/v1/index/intrames")
+def get_intra_month(
+    mes: str = Query(None, description="Month YYYY-MM (default: current)"),
+):
+    """
+    Intra-month price variation: how prices evolved within the current month.
+
+    Compares prices on the latest day vs the first day of the month.
+    Returns accumulated variation by division + daily time series.
+
+    This is the real-time inflation signal — usable from day 2 of each month.
+    """
+    try:
+        from engine.pipeline import calcular_variacion_intrames
+        if not mes:
+            mes = date.today().strftime("%Y-%m")
+        return calcular_variacion_intrames(mes)
+    except Exception as e:
+        return {"error": str(e), "mes": mes}
+
+
 @app.get("/api/v1/index/divisiones")
 def get_divisiones():
     if _latest_result and "divisiones" in _latest_result:

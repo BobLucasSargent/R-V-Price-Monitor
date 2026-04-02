@@ -348,3 +348,137 @@ def seed_empalme_data():
                            variacion=var, es_oficial=True)
 
     log.info("db.empalme_seeded")
+
+
+# ─── Intra-month (daily) queries ─────────────────────────────────────────────
+
+def get_daily_avg_by_division(fecha: date) -> dict[str, float]:
+    """
+    Geometric mean of prices per division for a specific day.
+    Returns: {"01": 2345.67, "02": 1234.56, ...}
+    """
+    session = get_session()
+    try:
+        rows = session.query(
+            PrecioRaw.division_coicop,
+            PrecioRaw.precio,
+        ).filter(
+            PrecioRaw.fecha == fecha,
+            PrecioRaw.precio > 0,
+            PrecioRaw.division_coicop.isnot(None),
+            PrecioRaw.division_coicop != "",
+        ).all()
+
+        if not rows:
+            return {}
+
+        by_division = defaultdict(list)
+        for div, precio in rows:
+            by_division[div].append(precio)
+
+        result = {}
+        for div, precios in by_division.items():
+            if precios:
+                result[div] = float(np.exp(np.mean(np.log(precios))))
+        return result
+
+    except Exception as e:
+        log.error("db.daily_avg_error", fecha=str(fecha), error=str(e))
+        return {}
+    finally:
+        session.close()
+
+
+def get_first_day_of_month_with_data(mes: str) -> date | None:
+    """Get the earliest date with price data in a given month."""
+    session = get_session()
+    try:
+        year, month = int(mes[:4]), int(mes[5:7])
+        fecha_inicio = date(year, month, 1)
+        if month == 12:
+            fecha_fin = date(year + 1, 1, 1)
+        else:
+            fecha_fin = date(year, month + 1, 1)
+
+        result = session.query(func.min(PrecioRaw.fecha)).filter(
+            PrecioRaw.fecha >= fecha_inicio,
+            PrecioRaw.fecha < fecha_fin,
+        ).scalar()
+        return result
+    except Exception:
+        return None
+    finally:
+        session.close()
+
+
+def get_last_day_of_month_with_data(mes: str) -> date | None:
+    """Get the latest date with price data in a given month."""
+    session = get_session()
+    try:
+        year, month = int(mes[:4]), int(mes[5:7])
+        fecha_inicio = date(year, month, 1)
+        if month == 12:
+            fecha_fin = date(year + 1, 1, 1)
+        else:
+            fecha_fin = date(year, month + 1, 1)
+
+        result = session.query(func.max(PrecioRaw.fecha)).filter(
+            PrecioRaw.fecha >= fecha_inicio,
+            PrecioRaw.fecha < fecha_fin,
+        ).scalar()
+        return result
+    except Exception:
+        return None
+    finally:
+        session.close()
+
+
+def get_all_daily_avgs_in_month(mes: str) -> dict[str, dict[str, float]]:
+    """
+    Get geometric mean prices per division for each day in a month.
+    Returns: {"2026-04-01": {"01": 2345.67, ...}, "2026-04-02": {...}, ...}
+    """
+    session = get_session()
+    try:
+        year, month = int(mes[:4]), int(mes[5:7])
+        fecha_inicio = date(year, month, 1)
+        if month == 12:
+            fecha_fin = date(year + 1, 1, 1)
+        else:
+            fecha_fin = date(year, month + 1, 1)
+
+        rows = session.query(
+            PrecioRaw.fecha,
+            PrecioRaw.division_coicop,
+            PrecioRaw.precio,
+        ).filter(
+            PrecioRaw.fecha >= fecha_inicio,
+            PrecioRaw.fecha < fecha_fin,
+            PrecioRaw.precio > 0,
+            PrecioRaw.division_coicop.isnot(None),
+            PrecioRaw.division_coicop != "",
+        ).all()
+
+        if not rows:
+            return {}
+
+        # Group by (date, division)
+        by_day_div = defaultdict(lambda: defaultdict(list))
+        for fecha, div, precio in rows:
+            by_day_div[fecha.isoformat()][div].append(precio)
+
+        # Compute geometric mean per (day, division)
+        result = {}
+        for day_str, divs in sorted(by_day_div.items()):
+            result[day_str] = {}
+            for div, precios in divs.items():
+                if precios:
+                    result[day_str][div] = float(np.exp(np.mean(np.log(precios))))
+
+        return result
+
+    except Exception as e:
+        log.error("db.all_daily_avgs_error", mes=mes, error=str(e))
+        return {}
+    finally:
+        session.close()
