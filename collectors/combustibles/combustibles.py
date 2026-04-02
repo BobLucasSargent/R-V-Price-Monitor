@@ -1,10 +1,10 @@
 """
 R&V IPC — Combustibles collector.
 
-Sources (in priority order):
-1. datos.energia.gob.ar — CKAN API (Secretaría de Energía open data)
-2. Argentina.gob.ar datos abiertos — fuel price datasets
-3. ArgentinaDatos API — /v1/finanzas/rendimientos (may have fuel data)
+Source: datos.energia.gob.ar — CKAN API (Secretaría de Energía open data)
+Dataset: "Precios en Surtidor - Resolución 314/2016"
+
+Resource ID for "Precios vigentes": 80ac25de-a44a-4445-9215-090cf55cfda5
 
 COICOP 07.2.2 — Combustibles y lubricantes (part of Div 07 Transporte).
 """
@@ -15,19 +15,17 @@ import structlog
 
 log = structlog.get_logger()
 
-# Multiple resource IDs to try — Secretaría de Energía rotates these
-ENERGIA_RESOURCES = [
-    "80ac25de-a44a-4f6b-b854-a5a6377e1023",  # Precios en surtidor
-    "8ffd4c9b-1c6c-4c11-8085-2f24b5fad6b9",  # Alternative resource
-]
-
 ENERGIA_API = "https://datos.energia.gob.ar/api/3/action/datastore_search"
 
+# Correct resource ID for "Precios vigentes en surtidor"
+RESOURCE_VIGENTES = "80ac25de-a44a-4445-9215-090cf55cfda5"
+
 FUEL_PRODUCTS = {
-    "nafta_super": "Nafta Súper",
-    "nafta_premium": "Nafta Premium / Infinia",
+    "nafta_super": "Nafta Súper (Grado 2)",
+    "nafta_premium": "Nafta Premium (Grado 3)",
     "gasoil_grado2": "Gasoil Grado 2",
-    "gasoil_grado3": "Gasoil Grado 3 / Infinia Diesel",
+    "gasoil_grado3": "Gasoil Grado 3",
+    "gnc": "GNC",
 }
 
 
@@ -35,102 +33,111 @@ FUEL_PRODUCTS = {
 class CombustiblesCollector(BaseCollector):
     collector_id = "combustibles"
     division_coicop = "07"
-    description = "Combustibles — Sec. Energía open data"
+    description = "Combustibles — Sec. Energía (datos.energia.gob.ar)"
 
     def collect(self) -> list[PriceObservation]:
-        # Try each resource ID
-        for resource_id in ENERGIA_RESOURCES:
-            try:
-                obs = self._collect_from_ckan(resource_id)
-                if obs:
-                    return obs
-            except Exception as e:
-                log.debug("combustibles.resource_error",
-                          resource_id=resource_id, error=str(e))
+        # Try direct resource first
+        obs = self._collect_from_resource(RESOURCE_VIGENTES)
+        if obs:
+            return obs
 
-        # Fallback: try to discover the right resource via package search
-        try:
-            obs = self._collect_via_package_search()
-            if obs:
-                return obs
-        except Exception as e:
-            log.debug("combustibles.package_search_error", error=str(e))
+        # Fallback: discover resource via package_show
+        obs = self._collect_via_discovery()
+        if obs:
+            return obs
 
         log.warning("combustibles.all_sources_failed")
         return []
 
-    def _collect_from_ckan(self, resource_id: str) -> list[PriceObservation]:
-        """Fetch fuel prices from CKAN datastore API."""
-        data = self.fetch_json(
-            ENERGIA_API,
-            params={
-                "resource_id": resource_id,
-                "limit": 200,
-                "sort": "fecha desc",
-            },
-        )
+    def _collect_from_resource(self, resource_id: str) -> list[PriceObservation]:
+        """Fetch fuel prices from a specific CKAN resource."""
+        try:
+            data = self.fetch_json(
+                ENERGIA_API,
+                params={
+                    "resource_id": resource_id,
+                    "limit": 500,
+                },
+            )
 
-        if not data.get("success"):
+            if not isinstance(data, dict) or not data.get("success"):
+                log.debug("combustibles.resource_not_success", resource_id=resource_id)
+                return []
+
+            records = data.get("result", {}).get("records", [])
+            if not records:
+                log.debug("combustibles.no_records", resource_id=resource_id)
+                return []
+
+            # Log field names for debugging
+            log.info("combustibles.fields_found",
+                     keys=list(records[0].keys()) if records else [],
+                     n_records=len(records))
+
+            return self._parse_records(records)
+
+        except Exception as e:
+            log.debug("combustibles.resource_error",
+                      resource_id=resource_id, error=str(e))
             return []
 
-        records = data.get("result", {}).get("records", [])
-        if not records:
-            return []
+    def _collect_via_discovery(self) -> list[PriceObservation]:
+        """Discover the right resource via package_show."""
+        try:
+            pkg = self.fetch_json(
+                "https://datos.energia.gob.ar/api/3/action/package_show",
+                params={"id": "precios-en-surtidor"},
+            )
 
-        log.info("combustibles.ckan_records", n=len(records),
-                 sample_keys=list(records[0].keys()) if records else [])
+            if not pkg.get("success"):
+                return []
 
-        return self._parse_fuel_records(records)
-
-    def _collect_via_package_search(self) -> list[PriceObservation]:
-        """Search CKAN for fuel price datasets if resource IDs are outdated."""
-        search_url = "https://datos.energia.gob.ar/api/3/action/package_search"
-        data = self.fetch_json(
-            search_url,
-            params={"q": "precios combustibles surtidor", "rows": 5},
-        )
-
-        if not data.get("success"):
-            return []
-
-        results = data.get("result", {}).get("results", [])
-        for dataset in results:
-            for resource in dataset.get("resources", []):
-                if resource.get("format", "").upper() in ("CSV", "JSON", "API"):
-                    rid = resource.get("id")
+            resources = pkg.get("result", {}).get("resources", [])
+            for r in resources:
+                name = (r.get("name", "") or r.get("description", "")).lower()
+                if "vigente" in name:
+                    rid = r.get("id")
                     if rid:
-                        try:
-                            obs = self._collect_from_ckan(rid)
-                            if obs:
-                                log.info("combustibles.discovered_resource", resource_id=rid)
-                                return obs
-                        except Exception:
-                            continue
+                        log.info("combustibles.discovered_resource",
+                                 resource_id=rid, name=name)
+                        obs = self._collect_from_resource(rid)
+                        if obs:
+                            return obs
+
+        except Exception as e:
+            log.debug("combustibles.discovery_error", error=str(e))
+
         return []
 
-    def _parse_fuel_records(self, records: list[dict]) -> list[PriceObservation]:
+    def _parse_records(self, records: list[dict]) -> list[PriceObservation]:
         """Parse CKAN records into price observations.
 
-        The field names vary by dataset version, so we try multiple patterns.
+        Field names from datos.energia.gob.ar:
+        - producto: "Nafta (grado 2)", "Nafta (grado 3)", "Gasoil (grado 2)", etc.
+        - precio: float in ARS/litro
+        - empresa / empresabandera: "YPF", "Shell", etc.
+        - provincia: "BUENOS AIRES", etc.
+        - localidad: city name
         """
         prices_by_type: dict[str, list[float]] = defaultdict(list)
 
         for record in records:
-            # Try different field name patterns
-            product = (
-                record.get("producto", "") or
-                record.get("PRODUCTO", "") or
-                record.get("tipo_combustible", "") or
-                ""
-            ).lower()
+            # Try multiple field name patterns
+            product = ""
+            for key in ["producto", "PRODUCTO", "tipo_combustible", "descripcion"]:
+                val = record.get(key)
+                if val:
+                    product = str(val).lower()
+                    break
 
-            price_raw = (
-                record.get("precio", None) or
-                record.get("PRECIO", None) or
-                record.get("precio_unitario", None)
-            )
+            price_raw = None
+            for key in ["precio", "PRECIO", "precio_unitario", "precioventa"]:
+                val = record.get(key)
+                if val is not None:
+                    price_raw = val
+                    break
 
-            if price_raw is None:
+            if not product or price_raw is None:
                 continue
 
             try:
@@ -138,32 +145,45 @@ class CombustiblesCollector(BaseCollector):
             except (ValueError, TypeError):
                 continue
 
-            if price <= 0:
+            if price <= 0 or price > 10000:  # Sanity: ARS/litro
+                continue
+
+            # Filter to Buenos Aires / GBA if possible
+            provincia = ""
+            for key in ["provincia", "PROVINCIA", "idprovincia"]:
+                val = record.get(key)
+                if val:
+                    provincia = str(val).upper()
+                    break
+
+            # Only GBA prices if province field exists
+            if provincia and "BUENOS AIRES" not in provincia and "CAPITAL" not in provincia:
                 continue
 
             # Classify fuel type
-            if "super" in product and "premium" not in product:
+            if ("grado 2" in product or "grado2" in product) and "nafta" in product:
                 prices_by_type["nafta_super"].append(price)
-            elif "premium" in product or "infinia" in product:
+            elif ("grado 3" in product or "grado3" in product) and "nafta" in product:
                 prices_by_type["nafta_premium"].append(price)
-            elif ("gasoil" in product or "diesel" in product) and \
-                 ("grado 2" in product or "comun" in product or "g2" in product):
+            elif "nafta" in product and "super" in product:
+                prices_by_type["nafta_super"].append(price)
+            elif "nafta" in product and ("premium" in product or "infinia" in product):
+                prices_by_type["nafta_premium"].append(price)
+            elif ("grado 2" in product or "grado2" in product) and ("gasoil" in product or "diesel" in product):
                 prices_by_type["gasoil_grado2"].append(price)
-            elif ("gasoil" in product or "diesel" in product) and \
-                 ("grado 3" in product or "premium" in product or "g3" in product):
+            elif ("grado 3" in product or "grado3" in product) and ("gasoil" in product or "diesel" in product):
                 prices_by_type["gasoil_grado3"].append(price)
-            elif "nafta" in product and "super" not in product and "premium" not in product:
-                # Generic nafta → treat as super
+            elif "gnc" in product or "gas natural" in product:
+                prices_by_type["gnc"].append(price)
+            elif "nafta" in product:
                 prices_by_type["nafta_super"].append(price)
             elif "gasoil" in product or "diesel" in product:
-                # Generic gasoil → treat as grado 2
                 prices_by_type["gasoil_grado2"].append(price)
 
         observations = []
         for fuel_key, price_list in prices_by_type.items():
             if not price_list:
                 continue
-            # Take median
             sorted_prices = sorted(price_list)
             median_price = sorted_prices[len(sorted_prices) // 2]
 
@@ -177,5 +197,9 @@ class CombustiblesCollector(BaseCollector):
                 url="https://datos.energia.gob.ar",
                 metadata={"n_estaciones": len(price_list), "tipo": fuel_key},
             ))
+
+        if observations:
+            log.info("combustibles.parsed_ok", n_products=len(observations),
+                     types=list(prices_by_type.keys()))
 
         return observations

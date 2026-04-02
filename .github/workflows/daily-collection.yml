@@ -1,33 +1,109 @@
 name: R&V IPC — Recolección diaria
- 
+
 on:
   schedule:
-    # 8:00 AM Argentina (UTC-3) = 11:00 UTC
     - cron: '0 11 * * *'
   workflow_dispatch:
-    # Permite trigger manual desde GitHub
- 
+
+env:
+  API_URL: https://r-v-price-monitor-production.up.railway.app
+
 jobs:
-  collect:
+  api-collectors:
     runs-on: ubuntu-latest
     timeout-minutes: 5
- 
     steps:
-      - name: Trigger pipeline diario
+      - name: Trigger pipeline (supermercados + dolar + combustibles)
         run: |
           echo "Triggering R&V IPC daily collection..."
-          curl -s -X POST "https://r-v-price-monitor-production.up.railway.app/api/v1/index/run?periodo=diario" \
+          RESULT=$(curl -s -X POST "${API_URL}/api/v1/index/run?periodo=diario" \
             -H "Content-Type: application/json" \
-            --max-time 120 || echo "Request timed out or failed"
- 
+            --max-time 120 || echo '{"error": "timeout"}')
+          echo "$RESULT" | python3 -m json.tool 2>/dev/null || echo "$RESULT"
+
       - name: Verificar health
+        run: curl -s "${API_URL}/health"
+
+  playwright-collectors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: api-collectors
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
         run: |
-          curl -s "https://r-v-price-monitor-production.up.railway.app/health"
- 
+          pip install httpx beautifulsoup4 lxml playwright structlog \
+                      tenacity pydantic-settings numpy
+          playwright install chromium --with-deps
 
+      - name: Run Playwright collectors and POST results
+        run: |
+          python3 << 'SCRIPT'
+          import httpx, json, sys, os
+          from datetime import date
 
+          sys.path.insert(0, os.getcwd())
+          API_URL = os.environ.get("API_URL", "https://r-v-price-monitor-production.up.railway.app")
 
+          from collectors.medicamentos.farmacity import FarmacityCollector
+          from collectors.electronica.fravega import FravegaCollector
+          from collectors.delivery.pedidosya import PedidosYaCollector
+          from collectors.alquileres.zonaprop import AlquileresCollector
+          from collectors.comunicacion.planes import ComunicacionesCollector
+          from collectors.tarifas.servicios import TarifasCollector
 
+          pw_collectors = [
+              FarmacityCollector(),
+              FravegaCollector(),
+              PedidosYaCollector(),
+              AlquileresCollector(),
+              ComunicacionesCollector(),
+              TarifasCollector(),
+          ]
 
+          all_results = []
+          for c in pw_collectors:
+              print(f"\n{'='*50}\nRunning: {c.collector_id}\n{'='*50}")
+              try:
+                  obs = c.run()
+                  print(f"  → {len(obs)} prices")
+                  prices = [{"producto": o.producto, "precio": o.precio,
+                             "unidad": o.unidad, "categoria_coicop": o.categoria_coicop,
+                             "division_coicop": o.division_coicop, "fuente": o.fuente}
+                            for o in obs]
+                  all_results.append({"collector_id": c.collector_id,
+                                      "n_precios": len(prices), "precios": prices})
+                  for p in prices[:3]:
+                      print(f"    {p['producto']}: ${p['precio']}")
+              except Exception as e:
+                  print(f"  → ERROR: {e}")
+                  all_results.append({"collector_id": c.collector_id,
+                                      "n_precios": 0, "error": str(e)})
 
+          # POST to API
+          print(f"\nPOSTing to {API_URL}...")
+          try:
+              payload = {"fecha": str(date.today()),
+                         "source": "github_actions_playwright",
+                         "collectors": all_results}
+              resp = httpx.post(f"{API_URL}/api/v1/prices/ingest-external",
+                                json=payload, timeout=30)
+              print(f"  → {resp.status_code}: {resp.text[:300]}")
+          except Exception as e:
+              print(f"  → POST failed: {e}")
+              print(json.dumps(all_results, indent=2, ensure_ascii=False))
 
+          total = sum(r.get("n_precios", 0) for r in all_results)
+          working = sum(1 for r in all_results if r.get("n_precios", 0) > 0)
+          print(f"\nSUMMARY: {working}/{len(pw_collectors)} working, {total} total prices")
+          SCRIPT
+
+      - name: Trigger recalculation
+        run: |
+          curl -s -X POST "${API_URL}/api/v1/index/run?periodo=diario" \
+            --max-time 120 | python3 -m json.tool 2>/dev/null || true

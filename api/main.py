@@ -345,3 +345,63 @@ def debug_run_single(
                 "available": list_collectors()}
     except Exception as e:
         return {"error": str(e), "collector": collector_id}
+
+
+@app.post("/api/v1/prices/ingest-external")
+def ingest_external_prices(payload: dict):
+    """
+    Receive prices from external sources (e.g. GitHub Actions Playwright job).
+    Saves them to DB as raw prices.
+    """
+    try:
+        from storage.repository import ensure_tables, save_raw_prices
+        from collectors.base import PriceObservation
+
+        ensure_tables()
+
+        fecha_str = payload.get("fecha", str(date.today()))
+        fecha_parsed = date.fromisoformat(fecha_str)
+        source = payload.get("source", "external")
+        collectors_data = payload.get("collectors", [])
+
+        total_saved = 0
+        results = []
+
+        for coll in collectors_data:
+            cid = coll.get("collector_id", "unknown")
+            precios = coll.get("precios", [])
+
+            if not precios:
+                results.append({"collector": cid, "saved": 0})
+                continue
+
+            # Convert to PriceObservation objects
+            observations = []
+            for p in precios:
+                try:
+                    observations.append(PriceObservation(
+                        producto=p.get("producto", ""),
+                        precio=float(p.get("precio", 0)),
+                        unidad=p.get("unidad", "unidad"),
+                        categoria_coicop=p.get("categoria_coicop", ""),
+                        division_coicop=p.get("division_coicop", ""),
+                        fuente=p.get("fuente", source),
+                    ))
+                except Exception:
+                    continue
+
+            n_saved = save_raw_prices(observations, cid, fecha_parsed)
+            total_saved += n_saved
+            results.append({"collector": cid, "received": len(precios), "saved": n_saved})
+
+        return {
+            "status": "ok",
+            "fecha": fecha_str,
+            "source": source,
+            "total_saved": total_saved,
+            "collectors": results,
+        }
+
+    except Exception as e:
+        log.error("ingest.error", error=str(e))
+        return {"error": str(e)}
