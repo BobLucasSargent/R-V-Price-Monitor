@@ -350,13 +350,161 @@ def seed_empalme_data():
     log.info("db.empalme_seeded")
 
 
-# ─── Intra-month (daily) queries ─────────────────────────────────────────────
+
+# ─── Intra-month (daily) queries — MATCHED PRODUCTS ──────────────────────────
+#
+# To measure price VARIATION between days, we compare the SAME products
+# on both days (matched pairs). This avoids artificial variation from
+# different product mixes between days.
+
+def get_matched_product_variations(fecha_base: date, fecha_comp: date) -> dict[str, float]:
+    """
+    Compute price variation by division using only products that appear
+    on BOTH dates (matched pairs).
+
+    Returns: {"01": 2.3, "02": -0.5, ...} — variation in %
+    """
+    session = get_session()
+    try:
+        rows = session.query(
+            PrecioRaw.fecha,
+            PrecioRaw.producto,
+            PrecioRaw.division_coicop,
+            PrecioRaw.precio,
+        ).filter(
+            PrecioRaw.fecha.in_([fecha_base, fecha_comp]),
+            PrecioRaw.precio > 0,
+            PrecioRaw.division_coicop.isnot(None),
+            PrecioRaw.division_coicop != "",
+        ).all()
+
+        if not rows:
+            return {}
+
+        prices_base = {}
+        prices_comp = {}
+
+        for fecha, producto, division, precio in rows:
+            key = (producto.strip().lower(), division)
+            if fecha == fecha_base:
+                if key in prices_base:
+                    prices_base[key] = (prices_base[key] + precio) / 2
+                else:
+                    prices_base[key] = precio
+            else:
+                if key in prices_comp:
+                    prices_comp[key] = (prices_comp[key] + precio) / 2
+                else:
+                    prices_comp[key] = precio
+
+        matched_keys = set(prices_base.keys()) & set(prices_comp.keys())
+
+        if not matched_keys:
+            log.warning("db.no_matched_products",
+                        base=str(fecha_base), comp=str(fecha_comp),
+                        n_base=len(prices_base), n_comp=len(prices_comp))
+            return {}
+
+        relatives_by_div = defaultdict(list)
+        for key in matched_keys:
+            producto, division = key
+            p_base = prices_base[key]
+            p_comp = prices_comp[key]
+            if p_base > 0 and p_comp > 0:
+                relative = p_comp / p_base
+                relatives_by_div[division].append(relative)
+
+        result = {}
+        for div, relatives in relatives_by_div.items():
+            if relatives:
+                geo_mean_relative = float(np.exp(np.mean(np.log(relatives))))
+                result[div] = (geo_mean_relative - 1) * 100
+
+        log.info("db.matched_variations",
+                 base=str(fecha_base), comp=str(fecha_comp),
+                 n_matched=len(matched_keys),
+                 divisions=list(result.keys()))
+
+        return result
+
+    except Exception as e:
+        log.error("db.matched_variations_error", error=str(e))
+        return {}
+    finally:
+        session.close()
+
+
+def get_matched_daily_series(mes: str) -> list[dict]:
+    """
+    Build daily variation series using matched products.
+    Each day is compared to the FIRST day of the month (base day).
+    """
+    session = get_session()
+    try:
+        year, month = int(mes[:4]), int(mes[5:7])
+        fecha_inicio = date(year, month, 1)
+        if month == 12:
+            fecha_fin = date(year + 1, 1, 1)
+        else:
+            fecha_fin = date(year, month + 1, 1)
+
+        dates = session.query(distinct(PrecioRaw.fecha)).filter(
+            PrecioRaw.fecha >= fecha_inicio,
+            PrecioRaw.fecha < fecha_fin,
+        ).order_by(PrecioRaw.fecha).all()
+
+        dates = sorted([d[0] for d in dates])
+
+        if len(dates) < 2:
+            if len(dates) == 1:
+                return [{"fecha": dates[0].isoformat(), "var_acumulada": 0.0,
+                         "var_por_division": {}, "n_matched": 0}]
+            return []
+
+        base_date = dates[0]
+        pesos = None
+
+        serie = [{"fecha": base_date.isoformat(), "var_acumulada": 0.0,
+                  "var_por_division": {}, "n_matched": 0}]
+
+        for comp_date in dates[1:]:
+            vars_div = get_matched_product_variations(base_date, comp_date)
+
+            if vars_div:
+                if pesos is None:
+                    from config.canasta import get_all_weights, EXCLUIDAS
+                    pesos = get_all_weights()
+
+                peso_total = sum(pesos.get(k, 0) for k in vars_div if k not in EXCLUIDAS)
+                if peso_total > 0:
+                    var_acum = sum(
+                        vars_div[k] * (pesos.get(k, 0) / peso_total)
+                        for k in vars_div
+                        if k not in EXCLUIDAS
+                    )
+                else:
+                    var_acum = 0.0
+            else:
+                var_acum = 0.0
+
+            serie.append({
+                "fecha": comp_date.isoformat(),
+                "var_acumulada": round(var_acum, 3),
+                "var_por_division": {k: round(v, 2) for k, v in vars_div.items()},
+                "n_matched": len(vars_div),
+            })
+
+        return serie
+
+    except Exception as e:
+        log.error("db.matched_daily_series_error", mes=mes, error=str(e))
+        return []
+    finally:
+        session.close()
+
 
 def get_daily_avg_by_division(fecha: date) -> dict[str, float]:
-    """
-    Geometric mean of prices per division for a specific day.
-    Returns: {"01": 2345.67, "02": 1234.56, ...}
-    """
+    """Geometric mean of prices per division for a specific day."""
     session = get_session()
     try:
         rows = session.query(
@@ -381,7 +529,6 @@ def get_daily_avg_by_division(fecha: date) -> dict[str, float]:
             if precios:
                 result[div] = float(np.exp(np.mean(np.log(precios))))
         return result
-
     except Exception as e:
         log.error("db.daily_avg_error", fecha=str(fecha), error=str(e))
         return {}
@@ -395,16 +542,10 @@ def get_first_day_of_month_with_data(mes: str) -> date | None:
     try:
         year, month = int(mes[:4]), int(mes[5:7])
         fecha_inicio = date(year, month, 1)
-        if month == 12:
-            fecha_fin = date(year + 1, 1, 1)
-        else:
-            fecha_fin = date(year, month + 1, 1)
-
-        result = session.query(func.min(PrecioRaw.fecha)).filter(
-            PrecioRaw.fecha >= fecha_inicio,
-            PrecioRaw.fecha < fecha_fin,
+        fecha_fin = date(year + (1 if month == 12 else 0), (month % 12) + 1, 1)
+        return session.query(func.min(PrecioRaw.fecha)).filter(
+            PrecioRaw.fecha >= fecha_inicio, PrecioRaw.fecha < fecha_fin,
         ).scalar()
-        return result
     except Exception:
         return None
     finally:
@@ -417,16 +558,10 @@ def get_last_day_of_month_with_data(mes: str) -> date | None:
     try:
         year, month = int(mes[:4]), int(mes[5:7])
         fecha_inicio = date(year, month, 1)
-        if month == 12:
-            fecha_fin = date(year + 1, 1, 1)
-        else:
-            fecha_fin = date(year, month + 1, 1)
-
-        result = session.query(func.max(PrecioRaw.fecha)).filter(
-            PrecioRaw.fecha >= fecha_inicio,
-            PrecioRaw.fecha < fecha_fin,
+        fecha_fin = date(year + (1 if month == 12 else 0), (month % 12) + 1, 1)
+        return session.query(func.max(PrecioRaw.fecha)).filter(
+            PrecioRaw.fecha >= fecha_inicio, PrecioRaw.fecha < fecha_fin,
         ).scalar()
-        return result
     except Exception:
         return None
     finally:
@@ -434,49 +569,35 @@ def get_last_day_of_month_with_data(mes: str) -> date | None:
 
 
 def get_all_daily_avgs_in_month(mes: str) -> dict[str, dict[str, float]]:
-    """
-    Get geometric mean prices per division for each day in a month.
-    Returns: {"2026-04-01": {"01": 2345.67, ...}, "2026-04-02": {...}, ...}
-    """
+    """Get geometric mean prices per division for each day in a month."""
     session = get_session()
     try:
         year, month = int(mes[:4]), int(mes[5:7])
         fecha_inicio = date(year, month, 1)
-        if month == 12:
-            fecha_fin = date(year + 1, 1, 1)
-        else:
-            fecha_fin = date(year, month + 1, 1)
+        fecha_fin = date(year + (1 if month == 12 else 0), (month % 12) + 1, 1)
 
         rows = session.query(
-            PrecioRaw.fecha,
-            PrecioRaw.division_coicop,
-            PrecioRaw.precio,
+            PrecioRaw.fecha, PrecioRaw.division_coicop, PrecioRaw.precio,
         ).filter(
-            PrecioRaw.fecha >= fecha_inicio,
-            PrecioRaw.fecha < fecha_fin,
-            PrecioRaw.precio > 0,
-            PrecioRaw.division_coicop.isnot(None),
+            PrecioRaw.fecha >= fecha_inicio, PrecioRaw.fecha < fecha_fin,
+            PrecioRaw.precio > 0, PrecioRaw.division_coicop.isnot(None),
             PrecioRaw.division_coicop != "",
         ).all()
 
         if not rows:
             return {}
 
-        # Group by (date, division)
         by_day_div = defaultdict(lambda: defaultdict(list))
         for fecha, div, precio in rows:
             by_day_div[fecha.isoformat()][div].append(precio)
 
-        # Compute geometric mean per (day, division)
         result = {}
         for day_str, divs in sorted(by_day_div.items()):
             result[day_str] = {}
             for div, precios in divs.items():
                 if precios:
                     result[day_str][div] = float(np.exp(np.mean(np.log(precios))))
-
         return result
-
     except Exception as e:
         log.error("db.all_daily_avgs_error", mes=mes, error=str(e))
         return {}
