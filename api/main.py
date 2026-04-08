@@ -230,6 +230,25 @@ def get_intra_month(
     except Exception as e:
         return {"error": str(e), "mes": mes}
 
+@app.get("/api/v1/index/intrames/nucleo")
+def get_intra_month_nucleo(
+    mes: str = Query(None, description="Month YYYY-MM (default: current)"),
+):
+    """
+    Inflación núcleo R&V intra-mes.
+
+    Misma metodología que /intrames pero excluyendo divisiones reguladas
+    (04 Vivienda/tarifas, 07 Transporte/combustibles).
+
+    Comparable con la categoría Núcleo del INDEC.
+    """
+    try:
+        from engine.pipeline import calcular_nucleo_intrames
+        if not mes:
+            mes = date.today().strftime("%Y-%m")
+        return calcular_nucleo_intrames(mes)
+    except Exception as e:
+        return {"error": str(e), "mes": mes}
 
 @app.get("/api/v1/index/divisiones")
 def get_divisiones():
