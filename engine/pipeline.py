@@ -439,3 +439,96 @@ def run_weekly_pipeline(fecha: date | None = None) -> dict:
 
 def run_monthly_pipeline(fecha: date | None = None) -> dict:
     return run_pipeline(fecha=fecha, periodo_tipo="mensual")
+    
+def calcular_nucleo_intrames(mes: str | None = None) -> dict:
+    """
+    Calcula la inflación núcleo R&V intra-mes.
+
+    Misma metodología que calcular_variacion_intrames() pero excluyendo:
+      - Regulados: 04 (Vivienda/tarifas), 07 (Transporte/combustibles)
+    """
+    if mes is None:
+        mes = date.today().strftime("%Y-%m")
+
+    try:
+        ensure_tables()
+    except Exception:
+        pass
+
+    from storage.repository import (
+        get_matched_product_variations,
+        get_first_day_of_month_with_data,
+        get_last_day_of_month_with_data,
+    )
+
+    REGULADOS = {"04", "07"}
+    EXCLUIDAS_NUCLEO = EXCLUIDAS | REGULADOS
+
+    primer_dia = get_first_day_of_month_with_data(mes)
+    ultimo_dia = get_last_day_of_month_with_data(mes)
+
+    if not primer_dia or not ultimo_dia:
+        return {
+            "mes": mes,
+            "error": "Sin datos para este mes",
+            "nucleo": None,
+            "n_dias": 0,
+        }
+
+    if primer_dia == ultimo_dia:
+        return {
+            "mes": mes,
+            "fecha_inicio": str(primer_dia),
+            "fecha_fin": str(ultimo_dia),
+            "n_dias": 1,
+            "nucleo": None,
+            "mensaje": "Solo 1 día con datos — se necesitan al menos 2 días",
+            "divisiones": {},
+        }
+
+    variaciones_div = get_matched_product_variations(primer_dia, ultimo_dia)
+    pesos = get_all_weights()
+
+    variaciones_nucleo = {
+        k: v for k, v in variaciones_div.items()
+        if k not in EXCLUIDAS_NUCLEO and v is not None
+    }
+
+    peso_nucleo_total = sum(pesos.get(k, 0) for k in variaciones_nucleo)
+
+    if peso_nucleo_total > 0:
+        nucleo = sum(
+            variaciones_nucleo[k] * (pesos.get(k, 0) / peso_nucleo_total)
+            for k in variaciones_nucleo
+        )
+    else:
+        nucleo = None
+
+    n_dias = get_collection_days_in_month(mes)
+
+    div_detail = {}
+    for div in DIVISIONES:
+        cod = div.codigo
+        if cod in EXCLUIDAS_NUCLEO:
+            continue
+        var = variaciones_div.get(cod)
+        div_detail[cod] = {
+            "nombre": div.nombre_corto,
+            "peso_ajustado": pesos.get(cod, 0),
+            "peso_nucleo": round(pesos.get(cod, 0) / peso_nucleo_total * 100, 4) if peso_nucleo_total > 0 else 0,
+            "variacion_acumulada": round(var, 2) if var is not None else None,
+            "tiene_datos": var is not None,
+        }
+
+    return {
+        "mes": mes,
+        "fecha_inicio": str(primer_dia),
+        "fecha_fin": str(ultimo_dia),
+        "n_dias": n_dias,
+        "nucleo": round(nucleo, 2) if nucleo is not None else None,
+        "inflacion_anualizada_estimada": round(inflacion_anualizada(nucleo), 1) if nucleo is not None else None,
+        "divisiones_excluidas_regulados": list(REGULADOS),
+        "divisiones_nucleo_con_datos": len(variaciones_nucleo),
+        "cobertura_nucleo_pct": round(peso_nucleo_total, 1),
+        "divisiones": div_detail,
+    }    
