@@ -1,19 +1,16 @@
 """
-Frávega collector — VTEX Search API (API-based, no Playwright)
-===============================================================
-Frávega uses VTEX (client since 2014). Public search API confirmed
-working 2026-04-08.
+Frávega collector — VTEX Search API (fulltext search)
+======================================================
+Frávega uses VTEX. Category paths don't match standard patterns,
+so we use fulltext search (?ft=term) which is confirmed working.
 
-API: GET https://www.fravega.com/api/catalog_system/pub/products/search/{path}?_from=0&_to=N
-
-Note: Frávega is a marketplace with multiple sellers. We take the price
-from the first seller with IsAvailable=true.
+API: GET https://www.fravega.com/api/catalog_system/pub/products/search?ft={term}&_from=0&_to=N
 
 Covers COICOP:
 - 05.3.1 Electrodomésticos grandes (heladeras, lavarropas, cocinas)
-- 05.3.2 Electrodomésticos pequeños (licuadoras, cafeteras, planchas)
-- 09.1.1 Equipos audiovisuales (TVs, audio)
-- 09.1.3 Equipos informáticos (notebooks, tablets)
+- 05.3.2 Electrodomésticos pequeños (microondas, cafeteras, licuadoras)
+- 09.1.1 Equipos audiovisuales (TVs)
+- 09.1.3 Equipos informáticos (notebooks, celulares)
 """
 
 from collectors.base import BaseCollector, PriceObservation
@@ -25,23 +22,20 @@ log = structlog.get_logger()
 BASE_URL = "https://www.fravega.com"
 SEARCH_PATH = "/api/catalog_system/pub/products/search"
 
-# (category_path or search_term, division, coicop, n_items, is_fulltext)
-CATEGORIES = [
-    # Div 05: Equipamiento y mantenimiento del hogar
-    # 05.3.1 Electrodomésticos grandes
-    ("electrodomesticos/heladeras", "05", "05.3.1", 10, False),
-    ("electrodomesticos/lavarropas", "05", "05.3.1", 10, False),
-    ("electrodomesticos/cocinas", "05", "05.3.1", 10, False),
-    # 05.3.2 Electrodomésticos pequeños
-    ("electrodomesticos/microondas", "05", "05.3.2", 8, False),
-    ("pequenos-electrodomesticos/licuadoras-y-minipimers", "05", "05.3.2", 8, False),
-    ("pequenos-electrodomesticos/cafeteras", "05", "05.3.2", 8, False),
-    # Div 09: Recreación y cultura
-    # 09.1.1 Equipos audiovisuales
-    ("tv-y-video/televisores", "09", "09.1.1", 10, False),
-    # 09.1.3 Equipos informáticos
-    ("informatica/notebooks", "09", "09.1.3", 8, False),
-    ("celulares-y-tablets/celulares-y-smartphones", "09", "09.1.3", 8, False),
+# (search_term, division, coicop, n_items)
+SEARCHES = [
+    # Div 05: Equipamiento del hogar — electrodomésticos grandes
+    ("heladera", "05", "05.3.1", 10),
+    ("lavarropas", "05", "05.3.1", 10),
+    ("cocina", "05", "05.3.1", 8),
+    # Div 05: Electrodomésticos pequeños
+    ("microondas", "05", "05.3.2", 8),
+    ("cafetera", "05", "05.3.2", 8),
+    ("licuadora", "05", "05.3.2", 8),
+    # Div 09: Recreación y cultura — audiovisual e informática
+    ("televisor", "09", "09.1.1", 10),
+    ("notebook", "09", "09.1.3", 10),
+    ("celular", "09", "09.1.3", 10),
 ]
 
 
@@ -56,34 +50,23 @@ class FravegaCollector(BaseCollector):
     def collect(self) -> list[PriceObservation]:
         observations: list[PriceObservation] = []
 
-        for cat_path, division, coicop, n_items, is_ft in CATEGORIES:
+        for term, division, coicop, n_items in SEARCHES:
             try:
-                if is_ft:
-                    url = f"{BASE_URL}{SEARCH_PATH}"
-                    params = {"ft": cat_path, "_from": 0, "_to": n_items - 1}
-                else:
-                    url = f"{BASE_URL}{SEARCH_PATH}/{cat_path}"
-                    params = {"_from": 0, "_to": n_items - 1}
-
+                url = f"{BASE_URL}{SEARCH_PATH}"
+                params = {"ft": term, "_from": 0, "_to": n_items - 1}
                 products = self.fetch_json(url, params=params)
 
+                count = 0
                 for product in products:
-                    obs = self._parse(product, division, coicop, cat_path)
+                    obs = self._parse(product, division, coicop, term)
                     if obs:
                         observations.append(obs)
+                        count += 1
 
-                log.info(
-                    "fravega.category",
-                    category=cat_path,
-                    products=len(products),
-                )
+                log.info("fravega.search", term=term, found=count)
 
             except Exception as e:
-                log.warning(
-                    "fravega.category_error",
-                    category=cat_path,
-                    error=str(e),
-                )
+                log.warning("fravega.search_error", term=term, error=str(e))
                 continue
 
         return observations
@@ -93,13 +76,11 @@ class FravegaCollector(BaseCollector):
         product: dict,
         division: str,
         coicop: str,
-        cat_path: str,
+        term: str,
     ) -> PriceObservation | None:
         """
-        Parse one VTEX product JSON.
-
-        Frávega is a marketplace: products can have multiple sellers.
-        We pick the first seller with IsAvailable=true and Price > 0.
+        Parse one VTEX product. Frávega is a marketplace — pick the
+        first seller with IsAvailable=true and Price > 0.
         """
         try:
             name = product.get("productName", "")
@@ -110,13 +91,11 @@ class FravegaCollector(BaseCollector):
             if not items:
                 return None
 
-            # Find the best available seller across all items
             price = 0
             seller_name = ""
 
             for item in items:
-                sellers = item.get("sellers", [])
-                for seller in sellers:
+                for seller in item.get("sellers", []):
                     offer = seller.get("commertialOffer", {})
                     s_price = offer.get("Price", 0)
                     is_available = offer.get("IsAvailable", False)
@@ -132,8 +111,7 @@ class FravegaCollector(BaseCollector):
             if price <= 0:
                 return None
 
-            # Sanity: Frávega sells from ~$5k (small items) to ~$10M (commercial)
-            # Skip extremes — commercial/industrial equipment and accessories
+            # Sanity: skip accessories under $5k and commercial/industrial over $10M
             if price < 5_000 or price > 10_000_000:
                 return None
 
@@ -148,7 +126,7 @@ class FravegaCollector(BaseCollector):
                 metadata={
                     "brand": brand,
                     "seller": seller_name,
-                    "vtex_category": cat_path,
+                    "search_term": term,
                 },
             )
 
