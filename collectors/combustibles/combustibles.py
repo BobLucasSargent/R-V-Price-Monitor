@@ -1,205 +1,204 @@
 """
-R&V IPC — Combustibles collector.
-
-Source: datos.energia.gob.ar — CKAN API (Secretaría de Energía open data)
-Dataset: "Precios en Surtidor - Resolución 314/2016"
-
-Resource ID for "Precios vigentes": 80ac25de-a44a-4445-9215-090cf55cfda5
-
-COICOP 07.2.2 — Combustibles y lubricantes (part of Div 07 Transporte).
+Combustibles collector — surtidores.com.ar + fallback hardcoded
+================================================================
+Scrapes YPF CABA prices from surtidores.com.ar/precios/ which has a
+clean HTML table with monthly prices per fuel type.
+ 
+Fuel prices in Argentina change every few weeks (not daily), so this
+collector also has hardcoded fallback values that should be updated
+when YPF announces price changes.
+ 
+Division COICOP: 07 (Transporte)
+Category: 07.2.2 (Combustibles y lubricantes)
+ 
+Current prices (April 2026, YPF CABA — frozen for 45 days):
+  Nafta Súper:    $1.999/litro
+  Infinia:        $2.207/litro
+  Diesel 500:     $2.065/litro
+  Infinia Diesel: $2.271/litro
 """
-from collectors.base import BaseCollector, PriceObservation
-from collectors.registry import register_collector
-from collections import defaultdict
+ 
+import re
+from collectors.base import BaseCollector, PriceObservation, parse_price_ar
 import structlog
-
+ 
 log = structlog.get_logger()
-
-ENERGIA_API = "https://datos.energia.gob.ar/api/3/action/datastore_search"
-
-# Correct resource ID for "Precios vigentes en surtidor"
-RESOURCE_VIGENTES = "80ac25de-a44a-4445-9215-090cf55cfda5"
-
-FUEL_PRODUCTS = {
-    "nafta_super": "Nafta Súper (Grado 2)",
-    "nafta_premium": "Nafta Premium (Grado 3)",
-    "gasoil_grado2": "Gasoil Grado 2",
-    "gasoil_grado3": "Gasoil Grado 3",
-    "gnc": "GNC",
+ 
+SURTIDORES_URL = "https://surtidores.com.ar/precios/"
+ 
+# Fallback prices — update these when YPF changes prices
+# Last updated: 2026-04-07 (source: surtidores.com.ar, Infobae)
+FALLBACK_PRICES = {
+    "Nafta Súper YPF (por litro)": 1999.0,
+    "Nafta Premium Infinia YPF (por litro)": 2207.0,
+    "Gasoil Diesel 500 YPF (por litro)": 2065.0,
+    "Gasoil Infinia Diesel YPF (por litro)": 2271.0,
 }
-
-
-@register_collector
+ 
+# Shell CABA prices (April 2026, source: Infobae 30-mar-2026)
+# Shell also froze prices along with YPF for 45 days from April 1
+SHELL_PRICES = {
+    "Nafta Súper Shell (por litro)": 2099.0,
+    "Nafta V-Power Shell (por litro)": 2379.0,
+    "Gasoil Diesel Shell (por litro)": 2200.0,
+    "Gasoil V-Power Diesel Shell (por litro)": 2440.0,
+}
+ 
+# Axion CABA prices (April 2026, source: Infobae 30-mar-2026)
+AXION_PRICES = {
+    "Nafta Súper Axion (por litro)": 2039.0,
+    "Nafta Quantium Axion (por litro)": 2310.0,
+    "Gasoil Diesel Axion (por litro)": 2160.0,
+    "Gasoil Quantium Diesel Axion (por litro)": 2390.0,
+}
+ 
+ 
 class CombustiblesCollector(BaseCollector):
+    """Collect fuel prices from surtidores.com.ar (YPF CABA) + hardcoded Shell."""
+ 
     collector_id = "combustibles"
     division_coicop = "07"
-    description = "Combustibles — Sec. Energía (datos.energia.gob.ar)"
-
+    description = "Combustibles — YPF y Shell CABA"
+ 
     def collect(self) -> list[PriceObservation]:
-        # Try direct resource first
-        obs = self._collect_from_resource(RESOURCE_VIGENTES)
-        if obs:
-            return obs
-
-        # Fallback: discover resource via package_show
-        obs = self._collect_via_discovery()
-        if obs:
-            return obs
-
-        log.warning("combustibles.all_sources_failed")
-        return []
-
-    def _collect_from_resource(self, resource_id: str) -> list[PriceObservation]:
-        """Fetch fuel prices from a specific CKAN resource."""
-        try:
-            data = self.fetch_json(
-                ENERGIA_API,
-                params={
-                    "resource_id": resource_id,
-                    "limit": 500,
-                },
-            )
-
-            if not isinstance(data, dict) or not data.get("success"):
-                log.debug("combustibles.resource_not_success", resource_id=resource_id)
-                return []
-
-            records = data.get("result", {}).get("records", [])
-            if not records:
-                log.debug("combustibles.no_records", resource_id=resource_id)
-                return []
-
-            # Log field names for debugging
-            log.info("combustibles.fields_found",
-                     keys=list(records[0].keys()) if records else [],
-                     n_records=len(records))
-
-            return self._parse_records(records)
-
-        except Exception as e:
-            log.debug("combustibles.resource_error",
-                      resource_id=resource_id, error=str(e))
-            return []
-
-    def _collect_via_discovery(self) -> list[PriceObservation]:
-        """Discover the right resource via package_show."""
-        try:
-            pkg = self.fetch_json(
-                "https://datos.energia.gob.ar/api/3/action/package_show",
-                params={"id": "precios-en-surtidor"},
-            )
-
-            if not pkg.get("success"):
-                return []
-
-            resources = pkg.get("result", {}).get("resources", [])
-            for r in resources:
-                name = (r.get("name", "") or r.get("description", "")).lower()
-                if "vigente" in name:
-                    rid = r.get("id")
-                    if rid:
-                        log.info("combustibles.discovered_resource",
-                                 resource_id=rid, name=name)
-                        obs = self._collect_from_resource(rid)
-                        if obs:
-                            return obs
-
-        except Exception as e:
-            log.debug("combustibles.discovery_error", error=str(e))
-
-        return []
-
-    def _parse_records(self, records: list[dict]) -> list[PriceObservation]:
-        """Parse CKAN records into price observations.
-
-        Field names from datos.energia.gob.ar:
-        - producto: "Nafta (grado 2)", "Nafta (grado 3)", "Gasoil (grado 2)", etc.
-        - precio: float in ARS/litro
-        - empresa / empresabandera: "YPF", "Shell", etc.
-        - provincia: "BUENOS AIRES", etc.
-        - localidad: city name
-        """
-        prices_by_type: dict[str, list[float]] = defaultdict(list)
-
-        for record in records:
-            # Try multiple field name patterns
-            product = ""
-            for key in ["producto", "PRODUCTO", "tipo_combustible", "descripcion"]:
-                val = record.get(key)
-                if val:
-                    product = str(val).lower()
-                    break
-
-            price_raw = None
-            for key in ["precio", "PRECIO", "precio_unitario", "precioventa"]:
-                val = record.get(key)
-                if val is not None:
-                    price_raw = val
-                    break
-
-            if not product or price_raw is None:
-                continue
-
-            try:
-                price = float(price_raw)
-            except (ValueError, TypeError):
-                continue
-
-            if price <= 0 or price > 10000:  # Sanity: ARS/litro
-                continue
-
-            # Filter to Buenos Aires / GBA if possible
-            provincia = ""
-            for key in ["provincia", "PROVINCIA", "idprovincia"]:
-                val = record.get(key)
-                if val:
-                    provincia = str(val).upper()
-                    break
-
-            # Only GBA prices if province field exists
-            if provincia and "BUENOS AIRES" not in provincia and "CAPITAL" not in provincia:
-                continue
-
-            # Classify fuel type
-            if ("grado 2" in product or "grado2" in product) and "nafta" in product:
-                prices_by_type["nafta_super"].append(price)
-            elif ("grado 3" in product or "grado3" in product) and "nafta" in product:
-                prices_by_type["nafta_premium"].append(price)
-            elif "nafta" in product and "super" in product:
-                prices_by_type["nafta_super"].append(price)
-            elif "nafta" in product and ("premium" in product or "infinia" in product):
-                prices_by_type["nafta_premium"].append(price)
-            elif ("grado 2" in product or "grado2" in product) and ("gasoil" in product or "diesel" in product):
-                prices_by_type["gasoil_grado2"].append(price)
-            elif ("grado 3" in product or "grado3" in product) and ("gasoil" in product or "diesel" in product):
-                prices_by_type["gasoil_grado3"].append(price)
-            elif "gnc" in product or "gas natural" in product:
-                prices_by_type["gnc"].append(price)
-            elif "nafta" in product:
-                prices_by_type["nafta_super"].append(price)
-            elif "gasoil" in product or "diesel" in product:
-                prices_by_type["gasoil_grado2"].append(price)
-
-        observations = []
-        for fuel_key, price_list in prices_by_type.items():
-            if not price_list:
-                continue
-            sorted_prices = sorted(price_list)
-            median_price = sorted_prices[len(sorted_prices) // 2]
-
+        observations: list[PriceObservation] = []
+ 
+        # 1. Try scraping surtidores.com.ar for YPF CABA latest prices
+        ypf_prices = self._scrape_surtidores()
+ 
+        if ypf_prices:
+            for name, price in ypf_prices.items():
+                observations.append(PriceObservation(
+                    producto=name,
+                    precio=price,
+                    unidad="litro",
+                    categoria_coicop="07.2.2",
+                    division_coicop="07",
+                    fuente="surtidores.com.ar",
+                    url=SURTIDORES_URL,
+                ))
+            log.info("combustibles.surtidores_ok", count=len(ypf_prices))
+        else:
+            # Fallback to hardcoded YPF prices
+            log.warning("combustibles.surtidores_failed, using fallback")
+            for name, price in FALLBACK_PRICES.items():
+                observations.append(PriceObservation(
+                    producto=name,
+                    precio=price,
+                    unidad="litro",
+                    categoria_coicop="07.2.2",
+                    division_coicop="07",
+                    fuente="combustibles_referencia",
+                    url="",
+                ))
+ 
+        # 2. Add Shell hardcoded prices (surtidores only has YPF)
+        for name, price in SHELL_PRICES.items():
             observations.append(PriceObservation(
-                producto=FUEL_PRODUCTS.get(fuel_key, fuel_key),
-                precio=median_price,
+                producto=name,
+                precio=price,
                 unidad="litro",
                 categoria_coicop="07.2.2",
                 division_coicop="07",
-                fuente="Secretaría de Energía",
-                url="https://datos.energia.gob.ar",
-                metadata={"n_estaciones": len(price_list), "tipo": fuel_key},
+                fuente="combustibles_referencia",
+                url="",
             ))
-
-        if observations:
-            log.info("combustibles.parsed_ok", n_products=len(observations),
-                     types=list(prices_by_type.keys()))
-
+ 
+        # 3. Add Axion hardcoded prices
+        for name, price in AXION_PRICES.items():
+            observations.append(PriceObservation(
+                producto=name,
+                precio=price,
+                unidad="litro",
+                categoria_coicop="07.2.2",
+                division_coicop="07",
+                fuente="combustibles_referencia",
+                url="",
+            ))
+ 
         return observations
+ 
+    def _scrape_surtidores(self) -> dict[str, float] | None:
+        """
+        Scrape surtidores.com.ar/precios/ for the latest YPF CABA prices.
+ 
+        The page has HTML tables with this structure (one per year):
+        | 2026  | Enero | Febrero | Marzo | Abril | ... |
+        | Super | 1566  | 1609    | 1999  | 1999  | ... |
+        | Premium | ...                                   |
+        | Gasoil  | ...                                   |
+        | Euro    | ...                                   |
+ 
+        We want the rightmost non-empty value in each row of the 2026 table.
+        """
+        try:
+            resp = self.fetch(SURTIDORES_URL)
+            html = resp.text
+ 
+            # Find the 2026 table rows
+            # The table has rows like: <td>Super</td><td>1566</td><td>1609</td>...
+            # We look for the pattern after "2026"
+ 
+            prices = {}
+ 
+            # Extract all numbers from the 2026 section
+            # Strategy: find "2026" then parse the next 4 data rows
+            fuel_names = {
+                "Super": "Nafta Súper YPF (por litro)",
+                "Premium": "Nafta Premium Infinia YPF (por litro)",
+                "Gasoil": "Gasoil Diesel 500 YPF (por litro)",
+                "Euro": "Gasoil Infinia Diesel YPF (por litro)",
+            }
+ 
+            # Use regex to find table cells after 2026 marker
+            # Pattern: find rows containing Super/Premium/Gasoil/Euro
+            # that come after a cell containing "2026"
+            section_2026 = html.split("2026")
+            if len(section_2026) < 2:
+                log.warning("combustibles.no_2026_section")
+                return None
+ 
+            # Take the section after first "2026" occurrence
+            section = section_2026[1]
+            # Only look until the next year table (2025)
+            if "2025" in section:
+                section = section.split("2025")[0]
+ 
+            for fuel_key, fuel_name in fuel_names.items():
+                # Find the row for this fuel type
+                # Look for the fuel name followed by numbers in td tags
+                pattern = rf'{fuel_key}.*?</tr>'
+                match = re.search(pattern, section, re.DOTALL | re.IGNORECASE)
+                if not match:
+                    continue
+ 
+                row_html = match.group(0)
+ 
+                # Extract all numbers from td tags in this row
+                numbers = re.findall(r'<td[^>]*>\s*(\d[\d.]*)\s*</td>', row_html)
+                if not numbers:
+                    continue
+ 
+                # Take the last (most recent month) non-empty value
+                last_price = None
+                for num_str in reversed(numbers):
+                    try:
+                        val = float(num_str.replace(".", "")) if "." in num_str and len(num_str.split(".")[-1]) == 3 else float(num_str)
+                        if val > 100:  # Sanity: fuel > $100/liter
+                            last_price = val
+                            break
+                    except ValueError:
+                        continue
+ 
+                if last_price:
+                    prices[fuel_name] = last_price
+ 
+            if len(prices) >= 3:  # Need at least 3 of 4 fuel types
+                return prices
+ 
+            log.warning("combustibles.insufficient_prices", found=len(prices))
+            return None
+ 
+        except Exception as e:
+            log.warning("combustibles.scrape_error", error=str(e))
+            return None
