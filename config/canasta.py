@@ -3,6 +3,14 @@ R&V IPC — Canasta COICOP con ponderadores GBA (dic 2016).
 
 Fuente: INDEC Metodología N°32, Cuadro 7 — Anexo II.
 Ponderadores regionales del IPC, región GBA.
+
+Divisiones excluidas por falta de cobertura:
+  - 03 Indumentaria     (8.49%) — no cubierto online
+  - 10 Educación        (3.02%) — no cubierto online
+  - 11 Restaurantes    (10.84%) — PedidosYa roto, sin fuente alternativa viable
+
+Los pesos de las divisiones activas se redistribuyen proporcionalmente
+mediante get_all_weights() para que sumen exactamente 100%.
 """
 from dataclasses import dataclass, field
 
@@ -21,7 +29,7 @@ class Division:
     codigo: str
     nombre: str
     nombre_corto: str
-    peso_gba: float  # % del nivel general
+    peso_gba: float  # % del nivel general (INDEC original)
     variedades: list[Variedad] = field(default_factory=list)
     collector_ids: list[str] = field(default_factory=list)
 
@@ -71,7 +79,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="03", nombre="Prendas de vestir y calzado",
         nombre_corto="Indumentaria", peso_gba=8.49,
-        collector_ids=[],  # Difícil de cubrir online
+        collector_ids=[],  # No cubierto — excluido
         variedades=[
             Variedad("03.1.2", "Prendas de vestir", 5.76, ["remera", "pantalón", "camisa"]),
             Variedad("03.2.1", "Zapatos y otros calzados", 2.09, ["zapatillas", "zapatos"]),
@@ -80,7 +88,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="04", nombre="Vivienda, agua, electricidad, gas y otros combustibles",
         nombre_corto="Vivienda y servicios", peso_gba=10.46,
-        collector_ids=["alquileres", "tarifas"],
+        collector_ids=["tarifas"],
         variedades=[
             Variedad("04.1.1", "Alquiler de la vivienda", 3.48, ["alquiler"]),
             Variedad("04.1.3", "Gastos comunes / expensas", 2.32, ["expensas"]),
@@ -159,7 +167,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="10", nombre="Educación",
         nombre_corto="Educación", peso_gba=3.02,
-        collector_ids=[],  # No disponible sistemáticamente online
+        collector_ids=[],  # No cubierto — excluido
         variedades=[
             Variedad("10.1", "Educación preescolar y primaria", 1.30, ["colegio"]),
             Variedad("10.3", "Educación postsecundaria", 0.63, ["universidad"]),
@@ -168,7 +176,7 @@ DIVISIONES: list[Division] = [
     Division(
         codigo="11", nombre="Restaurantes y hoteles",
         nombre_corto="Restaurantes y hoteles", peso_gba=10.84,
-        collector_ids=["pedidosya"],
+        collector_ids=[],  # PedidosYa roto, sin fuente alternativa viable — excluido
         variedades=[
             Variedad("11.1", "Restaurantes y comidas fuera del hogar", 10.31,
                      ["pizza", "empanada", "milanesa", "hamburguesa", "menú"]),
@@ -188,9 +196,11 @@ DIVISIONES: list[Division] = [
 
 
 # ─── DIVISIONES EXCLUIDAS ───────────────────────────────────────────────────
-# Indumentaria (03) y Educación (10) no se pueden cubrir online.
-# Se excluyen y se redistribuye su peso proporcionalmente al resto.
-EXCLUIDAS = {"03", "10"}
+# Su peso se redistribuye proporcionalmente al resto en get_all_weights().
+#   03 Indumentaria  (8.49%) — no cubierto online
+#   10 Educación     (3.02%) — no cubierto online
+#   11 Restaurantes (10.84%) — PedidosYa roto, sin fuente alternativa viable
+EXCLUIDAS = {"03", "10", "11"}
 
 
 # ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -199,46 +209,54 @@ def get_division(codigo: str) -> Division | None:
 
 
 def get_divisiones_activas() -> list[Division]:
-    """Returns only divisions with data coverage (excluding 03 and 10)."""
+    """Devuelve solo las divisiones con cobertura (excluye 03, 10 y 11)."""
     return [d for d in DIVISIONES if d.codigo not in EXCLUIDAS]
 
 
 def get_all_weights_raw() -> dict[str, float]:
-    """Returns original INDEC weights (sum ~100%)."""
+    """Ponderadores originales INDEC (suman ~100%)."""
     return {d.codigo: d.peso_gba for d in DIVISIONES}
 
 
 def get_all_weights() -> dict[str, float]:
     """
-    Returns adjusted weights with 03 and 10 excluded.
-    Redistributes their weight proportionally to remaining divisions.
-    Sum of returned weights = 100%.
+    Ponderadores ajustados: excluye divisiones sin cobertura y redistribuye
+    su peso proporcionalmente entre las divisiones activas.
+    La suma de los valores retornados es exactamente 100%.
+
+    Pesos resultantes (base GBA dic-2016, redistribuidos):
+      01 Alimentos          30.19%
+      02 Bebidas y tabaco    4.21%
+      04 Vivienda           13.47%
+      05 Equipamiento hogar  8.07%
+      06 Salud              11.33%
+      07 Transporte         14.93%
+      08 Comunicación        3.62%
+      09 Recreación          9.61%
+      12 Bienes varios       4.57%
     """
     activas = get_divisiones_activas()
     peso_activas = sum(d.peso_gba for d in activas)
-    # Rescale so active divisions sum to 100%
     factor = 100.0 / peso_activas
     return {d.codigo: round(d.peso_gba * factor, 4) for d in activas}
 
 
 def total_weight() -> float:
-    """Original INDEC weights (should sum ~100%)."""
+    """Suma de ponderadores originales INDEC (debe ser ~100%)."""
     return sum(d.peso_gba for d in DIVISIONES)
 
 
 def active_weight() -> float:
-    """Sum of adjusted active weights (should be exactly 100%)."""
+    """Suma de ponderadores ajustados (debe ser exactamente 100%)."""
     return sum(get_all_weights().values())
 
 
 def covered_weight() -> float:
-    """% of original GBA basket that has collectors."""
+    """% de la canasta GBA original con cobertura de collectors."""
     return sum(d.peso_gba for d in DIVISIONES if d.collector_ids)
 
 
-# Verify original weights sum ~100%
-assert 99.5 < total_weight() < 100.5, f"Weights sum = {total_weight()}"
-
-# Verify adjusted weights sum to 100%
+# ─── VALIDACIONES ────────────────────────────────────────────────────────────
+assert 99.5 < total_weight() < 100.5, f"Pesos originales suman {total_weight()}"
 _adj = active_weight()
-assert 99.9 < _adj < 100.1, f"Adjusted weights sum = {_adj}"
+assert 99.9 < _adj < 100.1, f"Pesos ajustados suman {_adj}"
