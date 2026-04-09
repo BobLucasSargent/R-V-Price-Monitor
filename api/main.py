@@ -444,6 +444,126 @@ def backfill_base_day(
     except Exception as e:
         log.error("backfill.error", error=str(e))
         return {"error": str(e)}
+
+@app.post("/api/v1/admin/replace-base-day-division")
+def replace_base_day_division(
+    division: str = Query(..., description="Division code, e.g. '06'"),
+    mes: str = Query(None, description="Month YYYY-MM (default: current)"),
+    dry_run: bool = Query(True, description="If True, only shows what would happen"),
+):
+    """
+    Replace prices for a specific division on the base day with
+    the most recent day's prices for that division.
+ 
+    Use this when a division has data on the base day but with different
+    product names than today, causing zero matched products.
+    """
+    try:
+        from storage.repository import (
+            ensure_tables, get_first_day_of_month_with_data, save_raw_prices,
+        )
+        from storage.models import PrecioRaw
+        from collectors.base import PriceObservation
+        from sqlalchemy import func, distinct
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy import create_engine
+        from config.settings import get_settings
+ 
+        ensure_tables()
+ 
+        if not mes:
+            mes = date.today().strftime("%Y-%m")
+ 
+        year, month = int(mes[:4]), int(mes[5:7])
+        if month == 12:
+            fecha_fin = date(year + 1, 1, 1)
+        else:
+            fecha_fin = date(year, month + 1, 1)
+        fecha_inicio = date(year, month, 1)
+ 
+        base_day = get_first_day_of_month_with_data(mes)
+        if not base_day:
+            return {"error": f"No hay datos para {mes}"}
+ 
+        s = get_settings()
+        engine = create_engine(s.DATABASE_URL_SYNC, pool_pre_ping=True)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+ 
+        try:
+            # Get current prices on base_day for this division
+            existing = session.query(PrecioRaw).filter(
+                PrecioRaw.fecha == base_day,
+                PrecioRaw.division_coicop == division,
+            ).all()
+ 
+            # Get most recent day's prices for this division
+            latest_date = session.query(func.max(PrecioRaw.fecha)).filter(
+                PrecioRaw.fecha >= fecha_inicio,
+                PrecioRaw.fecha < fecha_fin,
+                PrecioRaw.division_coicop == division,
+                PrecioRaw.fecha != base_day,
+            ).scalar()
+ 
+            if not latest_date:
+                return {"error": f"No hay precios recientes para división {division}"}
+ 
+            latest_rows = session.query(PrecioRaw).filter(
+                PrecioRaw.fecha == latest_date,
+                PrecioRaw.division_coicop == division,
+            ).all()
+ 
+            if dry_run:
+                return {
+                    "division": division,
+                    "base_day": str(base_day),
+                    "latest_date": str(latest_date),
+                    "precios_a_eliminar": len(existing),
+                    "productos_actuales": [r.producto for r in existing[:5]],
+                    "precios_a_insertar": len(latest_rows),
+                    "productos_nuevos": [r.producto for r in latest_rows[:5]],
+                    "dry_run": True,
+                    "nota": "Corré con dry_run=false para aplicar",
+                }
+ 
+            # Delete existing base day prices for this division
+            session.query(PrecioRaw).filter(
+                PrecioRaw.fecha == base_day,
+                PrecioRaw.division_coicop == division,
+            ).delete()
+            session.commit()
+ 
+        finally:
+            session.close()
+ 
+        # Insert latest prices with base_day date
+        observations = []
+        for row in latest_rows:
+            observations.append(PriceObservation(
+                producto=row.producto,
+                precio=row.precio,
+                unidad=row.unidad,
+                categoria_coicop=row.categoria_coicop or "",
+                division_coicop=row.division_coicop,
+                fuente=f"{row.fuente} [reemplazado desde {latest_date}]",
+                url=row.url or "",
+            ))
+ 
+        saved = save_raw_prices(observations, f"{division}_backfill", base_day)
+ 
+        return {
+            "division": division,
+            "base_day": str(base_day),
+            "latest_date": str(latest_date),
+            "eliminados": len(existing),
+            "insertados": saved,
+            "status": "ok — reemplazado",
+            "nota": "Ahora corré POST /api/v1/index/run para recalcular.",
+        }
+ 
+    except Exception as e:
+        log.error("replace_base_day.error", error=str(e))
+        return {"error": str(e)}
         
 @app.get("/api/v1/index/cobertura")
 def get_cobertura():
