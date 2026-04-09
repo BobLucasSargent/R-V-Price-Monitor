@@ -290,7 +290,161 @@ def get_divisiones():
         ],
     }
 
-
+@app.post("/api/v1/admin/backfill-base-day")
+def backfill_base_day(
+    mes: str = Query(None, description="Month YYYY-MM (default: current)"),
+    dry_run: bool = Query(True, description="If True, only shows what would be inserted without saving"),
+):
+    """
+    Fix divisions that are missing data on the first day of the month.
+ 
+    The matched-product comparison requires each division to have prices on
+    BOTH the base day (first day with data) AND the comparison day (latest).
+    If a collector only started working mid-month, it has no base day data
+    and shows null variation.
+ 
+    This endpoint takes the EARLIEST available prices for each missing division
+    and copies them to the base day, giving the system a valid starting point.
+ 
+    Safe to run multiple times (idempotent — skips divisions that already
+    have data on the base day).
+    """
+    try:
+        from storage.repository import (
+            ensure_tables, get_first_day_of_month_with_data,
+            save_raw_prices,
+        )
+        from storage.models import PrecioRaw
+        from collectors.base import PriceObservation
+        from sqlalchemy import func, distinct
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy import create_engine
+        from config.settings import get_settings
+ 
+        ensure_tables()
+ 
+        if not mes:
+            mes = date.today().strftime("%Y-%m")
+ 
+        year, month = int(mes[:4]), int(mes[5:7])
+        if month == 12:
+            fecha_fin = date(year + 1, 1, 1)
+        else:
+            fecha_fin = date(year, month + 1, 1)
+        fecha_inicio = date(year, month, 1)
+ 
+        # Get base day (first day with ANY data this month)
+        base_day = get_first_day_of_month_with_data(mes)
+        if not base_day:
+            return {"error": f"No hay datos para {mes}"}
+ 
+        s = get_settings()
+        engine = create_engine(s.DATABASE_URL_SYNC, pool_pre_ping=True)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+ 
+        try:
+            # Find which divisions already have data on base_day
+            divs_on_base = session.query(
+                distinct(PrecioRaw.division_coicop)
+            ).filter(
+                PrecioRaw.fecha == base_day,
+                PrecioRaw.division_coicop.isnot(None),
+                PrecioRaw.division_coicop != "",
+            ).all()
+            divs_on_base = {d[0] for d in divs_on_base}
+ 
+            # Find all divisions that have data this month
+            divs_this_month = session.query(
+                distinct(PrecioRaw.division_coicop)
+            ).filter(
+                PrecioRaw.fecha >= fecha_inicio,
+                PrecioRaw.fecha < fecha_fin,
+                PrecioRaw.division_coicop.isnot(None),
+                PrecioRaw.division_coicop != "",
+            ).all()
+            divs_this_month = {d[0] for d in divs_this_month}
+ 
+            # Divisions that need backfill
+            divs_missing = divs_this_month - divs_on_base
+ 
+            if not divs_missing:
+                return {
+                    "mes": mes,
+                    "base_day": str(base_day),
+                    "status": "ok — todas las divisiones ya tienen datos en el día base",
+                    "divisiones_con_base": sorted(divs_on_base),
+                }
+ 
+            results = []
+ 
+            for div in sorted(divs_missing):
+                # Find the earliest day this division has data
+                earliest_date = session.query(
+                    func.min(PrecioRaw.fecha)
+                ).filter(
+                    PrecioRaw.fecha >= fecha_inicio,
+                    PrecioRaw.fecha < fecha_fin,
+                    PrecioRaw.division_coicop == div,
+                ).scalar()
+ 
+                if not earliest_date:
+                    continue
+ 
+                # Get all prices from that earliest day for this division
+                rows = session.query(PrecioRaw).filter(
+                    PrecioRaw.fecha == earliest_date,
+                    PrecioRaw.division_coicop == div,
+                ).all()
+ 
+                if not rows:
+                    continue
+ 
+                result_entry = {
+                    "division": div,
+                    "earliest_date": str(earliest_date),
+                    "n_precios": len(rows),
+                    "productos": [r.producto for r in rows[:5]],
+                }
+ 
+                if not dry_run:
+                    # Build PriceObservation objects with base_day as fecha
+                    observations = []
+                    for row in rows:
+                        observations.append(PriceObservation(
+                            producto=row.producto,
+                            precio=row.precio,
+                            unidad=row.unidad,
+                            categoria_coicop=row.categoria_coicop or "",
+                            division_coicop=row.division_coicop,
+                            fuente=f"{row.fuente} [backfill desde {earliest_date}]",
+                            url=row.url or "",
+                        ))
+ 
+                    saved = save_raw_prices(observations, row.collector_id, base_day)
+                    result_entry["saved"] = saved
+                    result_entry["status"] = "backfilled"
+                else:
+                    result_entry["status"] = "dry_run — no se guardó nada"
+ 
+                results.append(result_entry)
+ 
+        finally:
+            session.close()
+ 
+        return {
+            "mes": mes,
+            "base_day": str(base_day),
+            "dry_run": dry_run,
+            "divisiones_ya_con_base": sorted(divs_on_base),
+            "divisiones_backfilleadas": results,
+            "nota": "Corré con dry_run=false para aplicar los cambios" if dry_run else "Cambios aplicados. Ahora corré POST /api/v1/index/run para recalcular.",
+        }
+ 
+    except Exception as e:
+        log.error("backfill.error", error=str(e))
+        return {"error": str(e)}
+        
 @app.get("/api/v1/index/cobertura")
 def get_cobertura():
     cubiertas = [d for d in DIVISIONES if d.collector_ids]
