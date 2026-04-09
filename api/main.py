@@ -454,9 +454,6 @@ def replace_base_day_division(
     """
     Replace prices for a specific division on the base day with
     the most recent day's prices for that division.
- 
-    Use this when a division has data on the base day but with different
-    product names than today, causing zero matched products.
     """
     try:
         from storage.repository import (
@@ -496,6 +493,8 @@ def replace_base_day_division(
                 PrecioRaw.fecha == base_day,
                 PrecioRaw.division_coicop == division,
             ).all()
+            existing_count = len(existing)
+            existing_productos = [r.producto for r in existing[:5]]
  
             # Get most recent day's prices for this division
             latest_date = session.query(func.max(PrecioRaw.fecha)).filter(
@@ -513,15 +512,30 @@ def replace_base_day_division(
                 PrecioRaw.division_coicop == division,
             ).all()
  
+            # Read all data while session is open
+            observations = []
+            collector_id = f"{division}_backfill"
+            for row in latest_rows:
+                collector_id = row.collector_id  # use real collector_id
+                observations.append(PriceObservation(
+                    producto=row.producto,
+                    precio=row.precio,
+                    unidad=row.unidad,
+                    categoria_coicop=row.categoria_coicop or "",
+                    division_coicop=row.division_coicop,
+                    fuente=f"{row.fuente} [reemplazado desde {latest_date}]",
+                    url=row.url or "",
+                ))
+ 
             if dry_run:
                 return {
                     "division": division,
                     "base_day": str(base_day),
                     "latest_date": str(latest_date),
-                    "precios_a_eliminar": len(existing),
-                    "productos_actuales": [r.producto for r in existing[:5]],
-                    "precios_a_insertar": len(latest_rows),
-                    "productos_nuevos": [r.producto for r in latest_rows[:5]],
+                    "precios_a_eliminar": existing_count,
+                    "productos_actuales": existing_productos,
+                    "precios_a_insertar": len(observations),
+                    "productos_nuevos": [o.producto for o in observations[:5]],
                     "dry_run": True,
                     "nota": "Corré con dry_run=false para aplicar",
                 }
@@ -536,26 +550,14 @@ def replace_base_day_division(
         finally:
             session.close()
  
-        # Insert latest prices with base_day date
-        observations = []
-        for row in latest_rows:
-            observations.append(PriceObservation(
-                producto=row.producto,
-                precio=row.precio,
-                unidad=row.unidad,
-                categoria_coicop=row.categoria_coicop or "",
-                division_coicop=row.division_coicop,
-                fuente=f"{row.fuente} [reemplazado desde {latest_date}]",
-                url=row.url or "",
-            ))
- 
-        saved = save_raw_prices(observations, f"{division}_backfill", base_day)
+        # Insert latest prices with base_day date (session already closed)
+        saved = save_raw_prices(observations, collector_id, base_day)
  
         return {
             "division": division,
             "base_day": str(base_day),
             "latest_date": str(latest_date),
-            "eliminados": len(existing),
+            "eliminados": existing_count,
             "insertados": saved,
             "status": "ok — reemplazado",
             "nota": "Ahora corré POST /api/v1/index/run para recalcular.",
