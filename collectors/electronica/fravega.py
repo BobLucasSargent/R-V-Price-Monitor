@@ -34,9 +34,20 @@ SEARCHES = [
     ("licuadora", "05", "05.3.2", 8),
     # Div 09: Recreación y cultura — audiovisual e informática
     ("televisor", "09", "09.1.1", 10),
+    ("smart tv", "09", "09.1.1", 10),
+    ("monitor", "09", "09.1.3", 8),
     ("notebook", "09", "09.1.3", 10),
+    ("tablet", "09", "09.1.3", 8),
     ("celular", "09", "09.1.3", 10),
+    ("auriculares", "09", "09.1.1", 8),
 ]
+
+# Sanity bounds por división
+PRICE_BOUNDS = {
+    "05": (5_000, 10_000_000),   # electrodomésticos
+    "09": (50_000, 5_000_000),   # electrónica — filtro más estricto
+}
+PRICE_DEFAULT = (5_000, 10_000_000)
 
 
 @register_collector
@@ -111,8 +122,9 @@ class FravegaCollector(BaseCollector):
             if price <= 0:
                 return None
 
-            # Sanity: skip accessories under $5k and commercial/industrial over $10M
-            if price < 5_000 or price > 10_000_000:
+            # Sanity bounds por división
+            price_min, price_max = PRICE_BOUNDS.get(division, PRICE_DEFAULT)
+            if price < price_min or price > price_max:
                 return None
 
             return PriceObservation(
