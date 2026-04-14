@@ -642,6 +642,8 @@ def debug_run_single(
         return {"error": str(e), "collector": collector_id}
 # Agregar en api/main.py antes del footer/último endpoint
 
+# Reemplazar el endpoint /api/v1/debug/matched-products en main.py
+
 @app.get("/api/v1/debug/matched-products")
 def debug_matched_products(
     division: str = Query(..., description="Division code, e.g. '06'"),
@@ -650,12 +652,6 @@ def debug_matched_products(
     """
     Show matched products for a division between base day and latest day.
     Useful for diagnosing unexpected variation in a division.
-
-    Returns each product with:
-    - precio_base: price on the first day of the month
-    - precio_actual: price on the latest day
-    - variacion_pct: individual price change
-    - contribucion: weighted contribution to division variation
     """
     try:
         from storage.repository import (
@@ -668,6 +664,7 @@ def debug_matched_products(
         from sqlalchemy import create_engine
         from config.settings import get_settings
         import numpy as np
+        from collections import defaultdict
 
         ensure_tables()
 
@@ -695,61 +692,54 @@ def debug_matched_products(
                 PrecioRaw.precio > 0,
             ).all()
 
-            prices_base = {}
-            prices_latest = {}
+            # Agrupar precios por (fecha, producto) — puede haber múltiples observaciones
+            grupos_base = defaultdict(list)
+            grupos_latest = defaultdict(list)
+            meta = {}  # nombre original y fuente por key
 
             for row in rows:
                 key = row.producto.strip().lower()
+                meta[key] = {"nombre": row.producto, "fuente": row.fuente}
                 if row.fecha == base_day:
-                    if key in prices_base:
-                        prices_base[key] = (prices_base[key]["precio"] + row.precio) / 2
-                    else:
-                        prices_base[key] = {
-                            "precio": row.precio,
-                            "nombre": row.producto,
-                            "fuente": row.fuente,
-                        }
+                    grupos_base[key].append(row.precio)
                 else:
-                    if key in prices_latest:
-                        prices_latest[key] = (prices_latest[key]["precio"] + row.precio) / 2
-                    else:
-                        prices_latest[key] = {
-                            "precio": row.precio,
-                            "nombre": row.producto,
-                            "fuente": row.fuente,
-                        }
+                    grupos_latest[key].append(row.precio)
 
         finally:
             session.close()
+
+        # Promedio por producto en cada día
+        prices_base = {k: float(np.mean(v)) for k, v in grupos_base.items()}
+        prices_latest = {k: float(np.mean(v)) for k, v in grupos_latest.items()}
 
         # Matched keys
         matched_keys = set(prices_base.keys()) & set(prices_latest.keys())
         unmatched_base = set(prices_base.keys()) - matched_keys
         unmatched_latest = set(prices_latest.keys()) - matched_keys
 
-        # Calculate variation per product
+        # Variación por producto
         productos_matched = []
         relatives = []
 
         for key in matched_keys:
-            p_base = prices_base[key]["precio"]
-            p_latest = prices_latest[key]["precio"]
+            p_base = prices_base[key]
+            p_latest = prices_latest[key]
             relative = p_latest / p_base
             relatives.append(relative)
             var_pct = (relative - 1) * 100
 
             productos_matched.append({
-                "producto": prices_base[key]["nombre"],
+                "producto": meta[key]["nombre"],
                 "precio_base": round(p_base, 2),
                 "precio_actual": round(p_latest, 2),
                 "variacion_pct": round(var_pct, 2),
-                "fuente": prices_base[key]["fuente"],
+                "fuente": meta[key]["fuente"],
             })
 
-        # Sort by variation descending
+        # Ordenar de mayor a menor variación
         productos_matched.sort(key=lambda x: x["variacion_pct"], reverse=True)
 
-        # Division geometric mean variation
+        # Media geométrica de la división
         if relatives:
             geo_mean = float(np.exp(np.mean(np.log(relatives))))
             var_division = round((geo_mean - 1) * 100, 3)
@@ -766,10 +756,10 @@ def debug_matched_products(
             "n_solo_en_base": len(unmatched_base),
             "n_solo_en_actual": len(unmatched_latest),
             "productos_no_matcheados_base": [
-                prices_base[k]["nombre"] for k in list(unmatched_base)[:10]
+                meta[k]["nombre"] for k in list(unmatched_base)[:10]
             ],
             "productos_no_matcheados_actual": [
-                prices_latest[k]["nombre"] for k in list(unmatched_latest)[:10]
+                meta[k]["nombre"] for k in list(unmatched_latest)[:10]
             ],
             "productos_matched": productos_matched,
         }
