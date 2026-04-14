@@ -640,7 +640,143 @@ def debug_run_single(
                 "available": list_collectors()}
     except Exception as e:
         return {"error": str(e), "collector": collector_id}
+# Agregar en api/main.py antes del footer/último endpoint
 
+@app.get("/api/v1/debug/matched-products")
+def debug_matched_products(
+    division: str = Query(..., description="Division code, e.g. '06'"),
+    mes: str = Query(None, description="Month YYYY-MM (default: current)"),
+):
+    """
+    Show matched products for a division between base day and latest day.
+    Useful for diagnosing unexpected variation in a division.
+
+    Returns each product with:
+    - precio_base: price on the first day of the month
+    - precio_actual: price on the latest day
+    - variacion_pct: individual price change
+    - contribucion: weighted contribution to division variation
+    """
+    try:
+        from storage.repository import (
+            ensure_tables,
+            get_first_day_of_month_with_data,
+            get_last_day_of_month_with_data,
+        )
+        from storage.models import PrecioRaw
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy import create_engine
+        from config.settings import get_settings
+        import numpy as np
+
+        ensure_tables()
+
+        if not mes:
+            mes = date.today().strftime("%Y-%m")
+
+        base_day = get_first_day_of_month_with_data(mes)
+        latest_day = get_last_day_of_month_with_data(mes)
+
+        if not base_day or not latest_day:
+            return {"error": f"Sin datos para {mes}"}
+
+        if base_day == latest_day:
+            return {"error": "Solo hay un día con datos, se necesitan al menos 2"}
+
+        s = get_settings()
+        engine = create_engine(s.DATABASE_URL_SYNC, pool_pre_ping=True)
+        SessionLocal = sessionmaker(bind=engine)
+        session = SessionLocal()
+
+        try:
+            rows = session.query(PrecioRaw).filter(
+                PrecioRaw.fecha.in_([base_day, latest_day]),
+                PrecioRaw.division_coicop == division,
+                PrecioRaw.precio > 0,
+            ).all()
+
+            prices_base = {}
+            prices_latest = {}
+
+            for row in rows:
+                key = row.producto.strip().lower()
+                if row.fecha == base_day:
+                    if key in prices_base:
+                        prices_base[key] = (prices_base[key]["precio"] + row.precio) / 2
+                    else:
+                        prices_base[key] = {
+                            "precio": row.precio,
+                            "nombre": row.producto,
+                            "fuente": row.fuente,
+                        }
+                else:
+                    if key in prices_latest:
+                        prices_latest[key] = (prices_latest[key]["precio"] + row.precio) / 2
+                    else:
+                        prices_latest[key] = {
+                            "precio": row.precio,
+                            "nombre": row.producto,
+                            "fuente": row.fuente,
+                        }
+
+        finally:
+            session.close()
+
+        # Matched keys
+        matched_keys = set(prices_base.keys()) & set(prices_latest.keys())
+        unmatched_base = set(prices_base.keys()) - matched_keys
+        unmatched_latest = set(prices_latest.keys()) - matched_keys
+
+        # Calculate variation per product
+        productos_matched = []
+        relatives = []
+
+        for key in matched_keys:
+            p_base = prices_base[key]["precio"]
+            p_latest = prices_latest[key]["precio"]
+            relative = p_latest / p_base
+            relatives.append(relative)
+            var_pct = (relative - 1) * 100
+
+            productos_matched.append({
+                "producto": prices_base[key]["nombre"],
+                "precio_base": round(p_base, 2),
+                "precio_actual": round(p_latest, 2),
+                "variacion_pct": round(var_pct, 2),
+                "fuente": prices_base[key]["fuente"],
+            })
+
+        # Sort by variation descending
+        productos_matched.sort(key=lambda x: x["variacion_pct"], reverse=True)
+
+        # Division geometric mean variation
+        if relatives:
+            geo_mean = float(np.exp(np.mean(np.log(relatives))))
+            var_division = round((geo_mean - 1) * 100, 3)
+        else:
+            var_division = None
+
+        return {
+            "division": division,
+            "mes": mes,
+            "base_day": str(base_day),
+            "latest_day": str(latest_day),
+            "variacion_division_pct": var_division,
+            "n_matched": len(matched_keys),
+            "n_solo_en_base": len(unmatched_base),
+            "n_solo_en_actual": len(unmatched_latest),
+            "productos_no_matcheados_base": [
+                prices_base[k]["nombre"] for k in list(unmatched_base)[:10]
+            ],
+            "productos_no_matcheados_actual": [
+                prices_latest[k]["nombre"] for k in list(unmatched_latest)[:10]
+            ],
+            "productos_matched": productos_matched,
+        }
+
+    except Exception as e:
+        log.error("debug_matched.error", error=str(e))
+        return {"error": str(e)}
 
 @app.post("/api/v1/prices/ingest-external")
 def ingest_external_prices(payload: dict):
