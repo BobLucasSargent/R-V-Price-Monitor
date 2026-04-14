@@ -357,10 +357,24 @@ def seed_empalme_data():
 # on both days (matched pairs). This avoids artificial variation from
 # different product mixes between days.
 
+# Reemplazar la función get_matched_product_variations en storage/repository.py
+# con esta versión que incluye winsorización para divisiones sin estacionalidad
+
+# Divisiones sin estacionalidad — floor de -15% por producto
+# Medicamentos, electrónica y electrodomésticos no tienen descuentos reales
+# de más del 15% — si bajan más, es casi siempre una promoción temporal
+
+DIVISIONES_SIN_ESTACIONALIDAD = {"05", "06", "09"}
+FLOOR_VARIACION_PCT = -15.0  # % máximo de baja permitida por producto
+
+
 def get_matched_product_variations(fecha_base: date, fecha_comp: date) -> dict[str, float]:
     """
     Compute price variation by division using only products that appear
     on BOTH dates (matched pairs).
+
+    For divisions without seasonality (05, 06, 09), applies a -15% floor
+    per product to avoid distortion from temporary discounts/promotions.
 
     Returns: {"01": 2.3, "02": -0.5, ...} — variation in %
     """
@@ -406,12 +420,31 @@ def get_matched_product_variations(fecha_base: date, fecha_comp: date) -> dict[s
             return {}
 
         relatives_by_div = defaultdict(list)
+        winsorized_count = defaultdict(int)
+
         for key in matched_keys:
             producto, division = key
             p_base = prices_base[key]
             p_comp = prices_comp[key]
+
             if p_base > 0 and p_comp > 0:
                 relative = p_comp / p_base
+                var_pct = (relative - 1) * 100
+
+                # Winsorización para divisiones sin estacionalidad
+                # Si baja más del floor, asumimos descuento promocional → tratamos como 0%
+                if division in DIVISIONES_SIN_ESTACIONALIDAD:
+                    if var_pct < FLOOR_VARIACION_PCT:
+                        log.debug(
+                            "db.winsorized_product",
+                            producto=producto,
+                            division=division,
+                            var_original=round(var_pct, 2),
+                            floor=FLOOR_VARIACION_PCT,
+                        )
+                        relative = 1.0  # sin variación
+                        winsorized_count[division] += 1
+
                 relatives_by_div[division].append(relative)
 
         result = {}
@@ -419,6 +452,14 @@ def get_matched_product_variations(fecha_base: date, fecha_comp: date) -> dict[s
             if relatives:
                 geo_mean_relative = float(np.exp(np.mean(np.log(relatives))))
                 result[div] = (geo_mean_relative - 1) * 100
+
+        if any(winsorized_count.values()):
+            log.info(
+                "db.winsorization_summary",
+                base=str(fecha_base),
+                comp=str(fecha_comp),
+                winsorized=dict(winsorized_count),
+            )
 
         log.info("db.matched_variations",
                  base=str(fecha_base), comp=str(fecha_comp),
