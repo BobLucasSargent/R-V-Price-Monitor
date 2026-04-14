@@ -631,7 +631,7 @@ def debug_run_single(
                     "categoria": o.categoria_coicop,
                     "fuente": o.fuente,
                 }
-                for o in observations[:30]
+                for o in observations
             ],
         }
     except KeyError:
