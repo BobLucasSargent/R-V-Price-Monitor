@@ -9,8 +9,8 @@ Fuente: INDEC, IPC GBA Base Diciembre 2016=100
 # Estos son los índices a los que se ancla la serie R&V.
 # Base: Diciembre 2016 = 100
 
-EMPALME_NIVEL_GENERAL = 10714.63
-EMPALME_FECHA = "2026-02"
+EMPALME_NIVEL_GENERAL = 11078.93
+EMPALME_FECHA = "2026-03"
 
 IPC_DIVISIONES_FEB2026 = {
     "01": 11624.98,   # Alimentos y bebidas no alcohólicas
