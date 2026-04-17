@@ -11,8 +11,15 @@ Covers COICOP:
 - 05.3.2 Electrodomésticos pequeños (microondas, cafeteras, licuadoras)
 - 09.1.1 Equipos audiovisuales (TVs)
 - 09.1.3 Equipos informáticos (notebooks, celulares)
+
+Rate limiting notes:
+- Div 05 terms work reliably without delay
+- Div 09 terms (especially multi-word or common terms) trigger JSONDecodeError
+  from Frávega's rate limiter when run consecutively from GH Actions IPs.
+  Fix: sleep between div 09 requests + use less common search terms.
 """
 
+import time
 from collectors.base import BaseCollector, PriceObservation
 from collectors.registry import register_collector
 import structlog
@@ -22,24 +29,27 @@ log = structlog.get_logger()
 BASE_URL = "https://www.fravega.com"
 SEARCH_PATH = "/api/catalog_system/pub/products/search"
 
-# (search_term, division, coicop, n_items)
+# (search_term, division, coicop, n_items, sleep_before)
+# sleep_before: seconds to wait before this request (0 = no wait)
 SEARCHES = [
     # Div 05: Equipamiento del hogar — electrodomésticos grandes
-    ("heladera", "05", "05.3.1", 10),
-    ("lavarropas", "05", "05.3.1", 10),
-    ("cocina", "05", "05.3.1", 8),
+    ("heladera",    "05", "05.3.1", 10, 0),
+    ("lavarropas",  "05", "05.3.1", 10, 0),
+    ("cocina",      "05", "05.3.1",  8, 0),
     # Div 05: Electrodomésticos pequeños
-    ("microondas", "05", "05.3.2", 8),
-    ("cafetera", "05", "05.3.2", 8),
-    ("licuadora", "05", "05.3.2", 8),
+    ("microondas",  "05", "05.3.2",  8, 0),
+    ("cafetera",    "05", "05.3.2",  8, 0),
+    ("licuadora",   "05", "05.3.2",  8, 0),
     # Div 09: Recreación y cultura — audiovisual e informática
-    ("televisor", "09", "09.1.1", 10),
-    ("smart tv", "09", "09.1.1", 10),
-    ("monitor", "09", "09.1.3", 8),
-    ("notebook", "09", "09.1.3", 10),
-    ("tablet", "09", "09.1.3", 8),
-    ("celular", "09", "09.1.3", 10),
-    ("auriculares", "09", "09.1.1", 8),
+    # Uses sleep + alternative terms to avoid rate limiting from GH Actions IPs.
+    # "smart tv" → "smarttv", "notebook" → "laptop", "celular" → "smartphone"
+    ("televisor",   "09", "09.1.1", 10, 3),
+    ("smarttv",     "09", "09.1.1", 10, 5),
+    ("monitor",     "09", "09.1.3",  8, 5),
+    ("laptop",      "09", "09.1.3", 10, 5),
+    ("tablet",      "09", "09.1.3",  8, 5),
+    ("smartphone",  "09", "09.1.3", 10, 5),
+    ("auriculares", "09", "09.1.1",  8, 5),
 ]
 
 # Sanity bounds por división
@@ -61,7 +71,11 @@ class FravegaCollector(BaseCollector):
     def collect(self) -> list[PriceObservation]:
         observations: list[PriceObservation] = []
 
-        for term, division, coicop, n_items in SEARCHES:
+        for term, division, coicop, n_items, sleep_before in SEARCHES:
+            if sleep_before > 0:
+                log.debug("fravega.rate_limit_sleep", term=term, seconds=sleep_before)
+                time.sleep(sleep_before)
+
             try:
                 url = f"{BASE_URL}{SEARCH_PATH}"
                 params = {"ft": term, "_from": 0, "_to": n_items - 1}
