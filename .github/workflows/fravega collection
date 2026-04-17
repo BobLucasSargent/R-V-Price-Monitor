@@ -1,0 +1,77 @@
+name: R&V IPC — Frávega (electrónica)
+
+on:
+  schedule:
+    - cron: '30 11 * * *'   # 30 minutos después del workflow principal (8:30am ART)
+  workflow_dispatch:
+
+env:
+  API_URL: https://r-v-price-monitor-production.up.railway.app
+
+jobs:
+  fravega-collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install httpx beautifulsoup4 lxml playwright structlog \
+                      tenacity pydantic-settings numpy
+          playwright install chromium --with-deps
+
+      - name: Run Frávega collector and POST results
+        run: |
+          python3 << 'SCRIPT'
+          import httpx, json, sys, os
+          from datetime import date
+
+          sys.path.insert(0, os.getcwd())
+          API_URL = os.environ.get("API_URL", "https://r-v-price-monitor-production.up.railway.app")
+
+          from collectors.electronica.fravega import FravegaCollector
+
+          collector = FravegaCollector()
+
+          print(f"\n{'='*50}\nRunning: {collector.collector_id}\n{'='*50}")
+          try:
+              obs = collector.run()
+              print(f"  → {len(obs)} prices")
+              prices = [{"producto": o.producto, "precio": o.precio,
+                         "unidad": o.unidad, "categoria_coicop": o.categoria_coicop,
+                         "division_coicop": o.division_coicop, "fuente": o.fuente}
+                        for o in obs]
+              result = {"collector_id": collector.collector_id,
+                        "n_precios": len(prices), "precios": prices}
+              for p in prices[:5]:
+                  print(f"    {p['producto']}: ${p['precio']}")
+          except Exception as e:
+              print(f"  → ERROR: {e}")
+              result = {"collector_id": collector.collector_id,
+                        "n_precios": 0, "error": str(e)}
+
+          # POST to API
+          print(f"\nPOSTing to {API_URL}...")
+          try:
+              payload = {"fecha": str(date.today()),
+                         "source": "github_actions_fravega",
+                         "collectors": [result]}
+              resp = httpx.post(f"{API_URL}/api/v1/prices/ingest-external",
+                                json=payload, timeout=30)
+              print(f"  → {resp.status_code}: {resp.text[:300]}")
+          except Exception as e:
+              print(f"  → POST failed: {e}")
+              print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          print(f"\nSUMMARY: {result.get('n_precios', 0)} prices collected")
+          SCRIPT
+
+      - name: Trigger recalculation
+        run: |
+          curl -s -X POST "${API_URL}/api/v1/index/run?periodo=diario" \
+            --max-time 120 | python3 -m json.tool 2>/dev/null || true
