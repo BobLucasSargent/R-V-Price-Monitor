@@ -51,7 +51,6 @@ jobs:
           API_URL = os.environ.get("API_URL", "https://r-v-price-monitor-production.up.railway.app")
 
           from collectors.medicamentos.farmacity import FarmacityCollector
-          from collectors.electronica.fravega import FravegaCollector
           from collectors.delivery.pedidosya import PedidosYaCollector
           from collectors.alquileres.zonaprop import AlquileresCollector
           from collectors.comunicacion.planes import ComunicacionesCollector
@@ -59,7 +58,6 @@ jobs:
 
           pw_collectors = [
               FarmacityCollector(),
-              FravegaCollector(),
               PedidosYaCollector(),
               AlquileresCollector(),
               ComunicacionesCollector(),
