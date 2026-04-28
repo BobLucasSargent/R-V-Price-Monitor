@@ -37,7 +37,7 @@ TARIFAS_REFERENCIA = {
     },
     "agua": {
         "nombre": "Agua y saneamiento AySA",
-        "precio": 12000.0,
+        "precio": 36000, # AySA Agua y Cloaca zona media, 12 m3/mes
         "coicop": "04.4",
         "fuente": "AySA / ERAS (referencia)",
         "url": "https://www.aysa.com.ar/usuarios/Factura-y-Consumo",
