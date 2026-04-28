@@ -23,7 +23,7 @@ log = structlog.get_logger()
 TARIFAS_REFERENCIA = {
     "electricidad": {
         "nombre": "Electricidad Edenor — consumo medio residencial (350 kWh/bim)",
-        "precio": 45000.0,
+        "precio": 32900,
         "coicop": "04.5.1",
         "fuente": "ENRE / Edenor (referencia)",
         "url": "https://www.edenor.com.ar/tarifas",
