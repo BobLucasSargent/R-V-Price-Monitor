@@ -30,7 +30,7 @@ TARIFAS_REFERENCIA = {
     },
     "gas": {
         "nombre": "Gas natural Metrogas — consumo medio residencial",
-        "precio": 28000.0,
+        "precio": 38000.0,  # R2 1°, 70 m3/mes, abril 2026
         "coicop": "04.5.2",
         "fuente": "ENARGAS / Metrogas (referencia)",
         "url": "https://www.metrogas.com.ar/tarifas",
